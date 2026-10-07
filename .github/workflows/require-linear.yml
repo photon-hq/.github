@@ -47,11 +47,18 @@ jobs:
               return;
             }
 
-            const pr = context.payload.pull_request;
-            if (!pr) {
+            const payloadPr = context.payload.pull_request;
+            if (!payloadPr) {
               core.setFailed(`Unexpected event "${context.eventName}": no pull_request payload.`);
               return;
             }
+
+            const { owner, repo } = context.repo;
+
+            // Re-fetch the PR instead of trusting the event payload. "Re-run jobs"
+            // replays the original payload, so labels / title / description added
+            // after the PR opened would otherwise be invisible to this check.
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: payloadPr.number });
 
             // 1. Bot allowlist (by PR author, not github.actor).
             const BOTS = new Set([
@@ -65,8 +72,6 @@ jobs:
               core.info(`PR author ${author} is an allowlisted bot. Passing.`);
               return;
             }
-
-            const { owner, repo } = context.repo;
 
             // 2. `no-linear` label: only valid if applied by a maintain/admin user.
             const labels = (pr.labels || []).map((l) => l.name);
