@@ -113,40 +113,48 @@ jobs:
             //    reference directly after a Linear magic word, since Linear ignores
             //    bare IDs in PR descriptions. The reference may be ENG-123,
             //    [ENG-123](url), or https://linear.app/<workspace>/issue/ENG-123/...
-            const idRe = /\bENG-\d+\b/i;
-            const magicRe = new RegExp(
-              '\\b(' +
-                'clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|complet(?:e|es|ed|ing)|' +
-                'ref|refs|references|part\\s+of|related\\s+to|contributes\\s+to|towards' +
-              ')\\s+\\[?(?:(?:https?:\\/\\/)?linear\\.app\\/[\\w.-]+\\/issue\\/)?(ENG-\\d+)\\b',
+            const bareId = /\bENG-\d+\b/i;
+            const MAGIC_WORDS = [
+              'close', 'closes', 'closed', 'closing',
+              'fix', 'fixes', 'fixed', 'fixing',
+              'resolve', 'resolves', 'resolved', 'resolving',
+              'complete', 'completes', 'completed', 'completing',
+              'ref', 'refs', 'references',
+              'part of', 'related to', 'contributes to', 'toward', 'towards',
+            ];
+            const magicRef = new RegExp(
+              '\\b(?:' + MAGIC_WORDS.map((w) => w.replace(' ', '\\s+')).join('|') + ')' +
+              '\\s+\\[?(?:(?:https?:\\/\\/)?linear\\.app\\/[^\\s/]+\\/issue\\/)?(ENG-\\d+)\\b',
               'i'
             );
             const checks = [
-              { field: 'title', value: pr.title || '', re: idRe },
-              { field: 'branch name', value: (pr.head && pr.head.ref) || '', re: idRe },
-              { field: 'description', value: pr.body || '', re: magicRe },
+              { field: 'title', value: pr.title || '', re: bareId },
+              { field: 'branch name', value: (pr.head && pr.head.ref) || '', re: bareId },
+              { field: 'description', value: pr.body || '', re: magicRef },
             ];
             for (const { field, value, re } of checks) {
               const m = value.match(re);
               if (m) {
-                const issue = (m[2] || m[0]).toUpperCase();
-                const how = m[2] ? ` (magic word "${m[1].replace(/\s+/g, ' ')}": "${m[0]}")` : '';
+                const issue = (m[1] || m[0]).toUpperCase();
+                const how = m[1] ? ` via magic word: "${m[0]}"` : '';
                 core.info(`Found Linear issue ${issue} in PR ${field}${how}. Passing.`);
                 return;
               }
             }
 
             // 4. Nothing found.
+            const hint = bareId.test(pr.body || '')
+              ? '\n注意：description 里有 issue ID，但前面没有 magic word，Linear 不会关联。\n' +
+                'Note: the description mentions an issue ID without a magic word, so Linear will not link it.\n'
+              : '';
             core.setFailed(
               'No Linear issue found. Reference one (e.g. ENG-123) in any of:\n' +
               '  - the PR title (anywhere, e.g. "ENG-123: add retry")\n' +
               '  - the branch name (use Linear\'s "Copy git branch name")\n' +
-              '  - the PR description, directly after a Linear magic word, e.g.\n' +
-              '      "Fixes ENG-123", "Part of ENG-123", "Related to ENG-123"\n' +
-              '    Closing words: close(s/d), closing, fix(es/ed), fixing, resolve(s/d), resolving,\n' +
-              '      complete(s/d), completing\n' +
-              '    Non-closing words: ref, refs, references, part of, related to, contributes to, towards\n' +
-              '    A bare ENG-123 or "Related: ENG-123" in the description does not count, because\n' +
-              '    Linear does not link the PR from it.\n' +
+              '  - the PR description, directly after a Linear magic word:\n' +
+              '      closes the issue:  Fixes / Closes / Resolves / Completes ENG-123\n' +
+              '      links only:        Part of / Related to / Refs / Contributes to ENG-123\n' +
+              '    (e.g. "Fixes ENG-123", "Part of ENG-123", "Related to ENG-123")\n' +
+              hint +
               'For PRs that genuinely need no issue, ask a maintainer to add the `no-linear` label.'
             );
