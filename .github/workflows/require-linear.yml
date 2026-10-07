@@ -66,6 +66,10 @@ jobs:
               'renovate[bot]',
               'release-please[bot]',
               'github-actions[bot]',
+              // Argo CD Image Updater: image-only deploy PRs in application-manifest.
+              'argocd-photon[bot]',
+              // Photon automation: dependency, composition and release PRs.
+              'photon-action-bot[bot]',
             ]);
             const author = pr.user && pr.user.login;
             if (BOTS.has(author)) {
