@@ -1,8 +1,14 @@
 # Require Linear issue
 #
 # Purpose: every PR must reference a Linear issue (ENG-123) in its title,
-# branch name, or description. Exemptions: known bots (by PR author) and PRs
-# carrying the `no-linear` label, which only maintain/admin users may apply.
+# branch name, or description. In the description the reference must follow a
+# Linear magic word (e.g. "Fixes ENG-123", "Part of ENG-123"), because that is
+# the only form Linear links from a PR description. If none of those match, a
+# Linear linkback comment (posted by Linear's bot once the PR is linked, e.g.
+# manually in Linear) also passes; the check polls for it for about 60s, after
+# which a manual "Re-run jobs" picks it up. Exemptions: known bots (by PR
+# author) and PRs carrying the `no-linear` label, which only maintain/admin
+# users may apply.
 #
 # Setup (org-wide):
 #   1. Commit this file to photon-hq/.github at .github/workflows/require-linear.yml
@@ -106,26 +112,90 @@ jobs:
               return;
             }
 
-            // 3. Look for an ENG-123 reference in title, branch name, or description.
-            const re = /\bENG-\d+\b/i;
-            const fields = {
-              title: pr.title || '',
-              branch: (pr.head && pr.head.ref) || '',
-              description: pr.body || '',
-            };
-            for (const [field, value] of Object.entries(fields)) {
+            // 3. Title and branch: an ENG-123 anywhere. Description: only an issue
+            //    reference directly after a Linear magic word, since Linear ignores
+            //    bare IDs in PR descriptions. The reference may be ENG-123,
+            //    [ENG-123](url), or https://linear.app/<workspace>/issue/ENG-123/...
+            const bareId = /\bENG-\d+\b/i;
+            const MAGIC_WORDS = [
+              'close', 'closes', 'closed', 'closing',
+              'fix', 'fixes', 'fixed', 'fixing',
+              'resolve', 'resolves', 'resolved', 'resolving',
+              'complete', 'completes', 'completed', 'completing',
+              'ref', 'refs', 'references',
+              'part of', 'related to', 'contributes to', 'toward', 'towards',
+            ];
+            const magicRef = new RegExp(
+              '\\b(?:' + MAGIC_WORDS.map((w) => w.replace(' ', '\\s+')).join('|') + ')' +
+              '\\s+\\[?(?:(?:https?:\\/\\/)?linear\\.app\\/[^\\s/]+\\/issue\\/)?(ENG-\\d+)\\b',
+              'i'
+            );
+            const checks = [
+              { field: 'title', value: pr.title || '', re: bareId },
+              { field: 'branch name', value: (pr.head && pr.head.ref) || '', re: bareId },
+              { field: 'description', value: pr.body || '', re: magicRef },
+            ];
+            for (const { field, value, re } of checks) {
               const m = value.match(re);
               if (m) {
-                core.info(`Found Linear issue ${m[0].toUpperCase()} in PR ${field}. Passing.`);
+                const issue = (m[1] || m[0]).toUpperCase();
+                const how = m[1] ? ` via magic word: "${m[0]}"` : '';
+                core.info(`Found Linear issue ${issue} in PR ${field}${how}. Passing.`);
                 return;
               }
             }
 
-            // 4. Nothing found.
+            // 4. Linear linkback comment: Linear's bot comments on the PR once the
+            //    issue is linked, however it was linked (title, description, or
+            //    manually in Linear). Only comments authored by the bot count.
+            //    The comment can land a few seconds after the PR opens, so poll briefly.
+            const LINEAR_BOTS = new Set(['linear-code[bot]', 'linear[bot]']);
+            const linkbackId = /linear\.app\/[^\s/"]+\/issue\/(ENG-\d+)/i;
+            const findLinkback = async () => {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+              for (const c of comments) {
+                if (!c.user || !LINEAR_BOTS.has(c.user.login)) continue;
+                const body = c.body || '';
+                const m = body.match(linkbackId);
+                if (body.includes('<!-- linear-linkback -->') || m) {
+                  return { login: c.user.login, id: m ? m[1].toUpperCase() : 'issue' };
+                }
+              }
+              return null;
+            };
+            const ATTEMPTS = 6;
+            const DELAY_MS = 10000;
+            for (let i = 1; i <= ATTEMPTS; i++) {
+              const hit = await findLinkback();
+              if (hit) {
+                core.info(`Found Linear linkback comment for ${hit.id} from ${hit.login}. Passing.`);
+                return;
+              }
+              if (i < ATTEMPTS) {
+                core.info(`No Linear linkback comment yet (attempt ${i}/${ATTEMPTS}); retrying in ${DELAY_MS / 1000}s.`);
+                await new Promise((r) => setTimeout(r, DELAY_MS));
+              }
+            }
+
+            // 5. Nothing found.
+            const hint = bareId.test(pr.body || '')
+              ? '\n注意：description 里有 issue ID，但前面没有 magic word，Linear 不会关联。\n' +
+                'Note: the description mentions an issue ID without a magic word, so Linear will not link it.\n'
+              : '';
             core.setFailed(
               'No Linear issue found. Reference one (e.g. ENG-123) in any of:\n' +
-              '  - the PR title\n' +
+              '  - the PR title (anywhere, e.g. "ENG-123: add retry")\n' +
               '  - the branch name (use Linear\'s "Copy git branch name")\n' +
-              '  - the PR description (e.g. "Fixes ENG-123")\n' +
+              '  - the PR description, directly after a Linear magic word:\n' +
+              '      closes the issue:  Fixes / Closes / Resolves / Completes ENG-123\n' +
+              '      links only:        Part of / Related to / Refs / Contributes to ENG-123\n' +
+              '    (e.g. "Fixes ENG-123", "Part of ENG-123", "Related to ENG-123")\n' +
+              '  - or link the PR to an issue manually in Linear, then click "Re-run jobs" on this check\n' +
+              hint +
               'For PRs that genuinely need no issue, ask a maintainer to add the `no-linear` label.'
             );
