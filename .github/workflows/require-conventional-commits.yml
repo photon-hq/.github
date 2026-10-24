@@ -1,0 +1,95 @@
+# Require Conventional Commits
+#
+# Purpose: every PR title must follow Conventional Commits
+# (https://www.conventionalcommits.org), e.g. "feat(api): add retry (ENG-123)".
+# A squash merge turns the PR title into the commit on the default branch, so
+# checking the title keeps that history conventional without policing the
+# work-in-progress commits on feature branches. GitHub's own revert titles
+# (Revert "feat: ...") also pass. Exemptions: known bots (by PR author).
+#
+# Setup (org-wide):
+#   1. Commit this file to photon-hq/.github at .github/workflows/require-conventional-commits.yml
+#   2. Org Settings -> Rules -> Rulesets -> New branch ruleset
+#      - Target: all repositories, default branch
+#      - Enable "Require workflows to pass before merging"
+#      - Add workflow: photon-hq/.github, path .github/workflows/require-conventional-commits.yml
+#   3. In each repository, set Settings -> General -> Pull Requests ->
+#      "Allow squash merging" -> Default commit message to "Pull request title";
+#      the default ("Default message") uses the commit message instead of the
+#      PR title for single-commit PRs.
+#
+# The job always runs and explicitly passes or fails (no `if:` skips), so a
+# skipped check can never satisfy the ruleset.
+
+name: Require Conventional Commits
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  merge_group:
+
+permissions:
+  pull-requests: read
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title follows Conventional Commits
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Merge queue: the PR was already checked before entering the queue.
+            if (context.eventName === 'merge_group') {
+              core.info('merge_group event: PR was already checked before entering the queue. Passing.');
+              return;
+            }
+
+            const payloadPr = context.payload.pull_request;
+            if (!payloadPr) {
+              core.setFailed(`Unexpected event "${context.eventName}": no pull_request payload.`);
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+
+            // Re-fetch the PR instead of trusting the event payload. "Re-run jobs"
+            // replays the original payload, so a title fixed after the PR opened
+            // would otherwise be invisible to this check.
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: payloadPr.number });
+
+            // 1. Bot allowlist (by PR author, not github.actor).
+            const BOTS = new Set([
+              'dependabot[bot]',
+              'renovate[bot]',
+              'release-please[bot]',
+              'github-actions[bot]',
+              'argocd-photon[bot]',
+              'photon-action-bot[bot]',
+            ]);
+            const author = pr.user && pr.user.login;
+            if (BOTS.has(author)) {
+              core.info(`PR author ${author} is an allowlisted bot. Passing.`);
+              return;
+            }
+
+            // 2. <type>[(scope)][!]: <description>, or GitHub's Revert "<title>".
+            const title = pr.title || '';
+            const TYPES = ['feat', 'fix', 'docs', 'style', 'refactor', 'perf', 'test', 'build', 'ci', 'chore', 'revert'];
+            const conventional = new RegExp('^(?:' + TYPES.join('|') + ')(?:\\([^()\\s][^()]*\\))?!?: \\S');
+            const githubRevert = /^Revert ".+"$/;
+            if (conventional.test(title) || githubRevert.test(title)) {
+              core.info(`PR title "${title}" follows Conventional Commits. Passing.`);
+              return;
+            }
+
+            core.setFailed(
+              `PR 标题不符合 Conventional Commits 格式 / PR title does not follow Conventional Commits: "${title}"\n` +
+              'Expected: <type>(<optional scope>)<optional !>: <description>\n' +
+              `  type: ${TYPES.join(', ')} (lowercase)\n` +
+              'Examples:\n' +
+              '  feat(api): add retry to webhook delivery (ENG-123)\n' +
+              '  fix: keep the session alive after reconnect (ENG-123)\n' +
+              '  feat(policy)!: drop the initial organization route (ENG-123)\n' +
+              'Edit the PR title; this check re-runs automatically.'
+            );
