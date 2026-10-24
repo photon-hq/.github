@@ -7,6 +7,13 @@
 # work-in-progress commits on feature branches. GitHub's own revert titles
 # (Revert "feat: ...") also pass. Exemptions: known bots (by PR author).
 #
+# A ruleset runs this workflow only on the default pull_request activity types
+# (opened, synchronize, reopened) and ignores `types:`. A title edit therefore
+# does not re-run the check: after fixing a title, click "Re-run jobs" or push
+# a commit. A title edited after the check passed is not re-checked; only a
+# commit message rule on the default branch (ruleset metadata restriction)
+# catches that case.
+#
 # Setup (org-wide):
 #   1. Commit this file to photon-hq/.github at .github/workflows/require-conventional-commits.yml
 #   2. Org Settings -> Rules -> Rulesets -> New branch ruleset
@@ -25,7 +32,7 @@ name: Require Conventional Commits
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
   merge_group:
 
 permissions:
@@ -54,7 +61,7 @@ jobs:
             const { owner, repo } = context.repo;
 
             // Re-fetch the PR instead of trusting the event payload. "Re-run jobs"
-            // replays the original payload, so a title fixed after the PR opened
+            // replays the original payload, so a title fixed before the re-run
             // would otherwise be invisible to this check.
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: payloadPr.number });
 
@@ -91,5 +98,6 @@ jobs:
               '  feat(api): add retry to webhook delivery (ENG-123)\n' +
               '  fix: keep the session alive after reconnect (ENG-123)\n' +
               '  feat(policy)!: drop the initial organization route (ENG-123)\n' +
-              'Edit the PR title; this check re-runs automatically.'
+              '修改 PR 标题后，点击此检查的 "Re-run jobs"（或 push 一个新 commit）。\n' +
+              'After editing the PR title, click "Re-run jobs" on this check (or push a commit).'
             );
