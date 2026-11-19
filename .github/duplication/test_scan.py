@@ -1,9 +1,33 @@
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 
-from scan import added, grouped
+from scan import added, detect, grouped
 
 
 class ClassificationTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("jscpd"), "requires jscpd 5.4.3 on PATH")
+    def test_relative_ignore_globs_do_not_exclude_the_base_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = Path(tmp)
+            bin_dir = tool / "node_modules/.bin"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "jscpd").symlink_to(shutil.which("jscpd"))
+            (tool / "config.json").write_text(json.dumps({"ignore": ["**/base/**"], "minLines": 3, "minTokens": 12}))
+            scans = []
+            for side in ("base", "head"):
+                root = tool / side
+                subprocess.run(["git", "init", "-q", root], check=True)
+                for name in ("a.ts", "b.ts"):
+                    (root / name).write_text("function sum(values) {\n let total = 0;\n for (const v of values) total += v;\n return total;\n}\n")
+                subprocess.run(["git", "add", "."], cwd=root, check=True)
+                scans.append(detect("exact", tool, root, side, ["--kind", "exact"]))
+            self.assertEqual(len(scans[0]), 1)
+            self.assertEqual(added(*scans, {}), [])
+
     def test_old_and_renamed_pairs_do_not_mask_the_new_copy(self):
         old = [["original.ts", 1, 8], ["reader.ts", 2, 10]]
         moved = [["moved.ts", 15, 22], ["reader.ts", 2, 10]]

@@ -51,7 +51,8 @@ def config():
 
 def detect(mode, tool, root, side, args):
     output = tool / f"{mode}-{side}"
-    command = [tool / "node_modules/.bin/jscpd", ".", "--config", tool / "config.json", "--absolute",
+    # Relative scans keep repository ignore globs independent of the runner's checkout names.
+    command = [tool / "node_modules/.bin/jscpd", ".", "--config", tool / "config.json",
                "--reporters", "json,sarif" if mode == "exact" else "sarif", "--output", output, *args]
     with (tool / f"{mode}-{side}.log").open("w+") as log:
         subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -72,7 +73,7 @@ def detect(mode, tool, root, side, args):
         pair = []
         for loc in (entry["locations"][0], entry["relatedLocations"][0]):
             physical = loc["physicalLocation"]
-            name = os.path.relpath(physical["artifactLocation"]["uri"], root)
+            name = physical["artifactLocation"]["uri"]
             if name not in tracked:
                 raise ValueError("Unexpected source outside the scanned tree")
             region = physical["region"]
