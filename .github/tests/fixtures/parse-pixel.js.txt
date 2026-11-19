@@ -1,0 +1,8 @@
+export function parsePixel(hexColor) {
+  const hex = hexColor.replace(/^#/, "").toLowerCase();
+  if (!/^[0-9a-f]{6}$/.test(hex)) return null;
+  const red = parseInt(hex.slice(0, 2), 16);
+  const green = parseInt(hex.slice(2, 4), 16);
+  const blue = parseInt(hex.slice(4, 6), 16);
+  return [red, green, blue];
+}

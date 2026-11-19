@@ -1,0 +1,9 @@
+export function pixelChannels(hexColor) {
+  const hex = hexColor.replace(/^#/, "").toLowerCase();
+  if (!/^[0-9a-f]{6}$/.test(hex)) return null;
+  const channels = [];
+  for (let offset = 0; offset < 6; offset += 2) {
+    channels.push(parseInt(hex.substring(offset, offset + 2), 16));
+  }
+  return channels;
+}

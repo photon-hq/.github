@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -17,6 +18,12 @@ RULES = {
     "jscpd/semantic-code": "semantic",
 }
 MODES = {"exact": ["exact"], "structural": ["renamed", "gap", "ast"], "semantic": ["semantic"]}
+SEMANTIC_PROGRESS = re.compile(
+    r"Semantic clones \(experimental\): (?:embedding (\d+)(?: of \d+)? functions with "
+    r"nomic-ai/CodeRankEmbed on this machine(?:, the rest cached)?|"
+    r"\d+ functions, all embeddings cached \(nomic-ai/CodeRankEmbed\))\n"
+)
+PR_MISS_LIMIT = 32
 
 
 def git(*args, cwd=None):
@@ -54,15 +61,29 @@ def detect(mode, tool, root, side, args):
     # Relative scans keep repository ignore globs independent of the runner's checkout names.
     command = [tool / "node_modules/.bin/jscpd", ".", "--config", tool / "config.json",
                "--reporters", "json,sarif" if mode == "exact" else "sarif", "--output", output, *args]
-    with (tool / f"{mode}-{side}.log").open("w+") as log:
-        subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
+    with (tool / f"{mode}-{side}.log").open("w") as log:
         if mode == "semantic":
-            log.seek(0)
-            for line in log:
-                if re.fullmatch(r"Semantic clones \(experimental\): (?:embedding \d+(?: of \d+)? functions with nomic-ai/CodeRankEmbed on this machine(?:, the rest cached)?|\d+ functions, all embeddings cached \(nomic-ai/CodeRankEmbed\))\n", line):
-                    print(f"{side}: {line.rstrip()}")
-                    if "all embeddings cached" not in line:
-                        emit("embedded", "true")
+            bounded = side == "base" or (side == "head" and os.getenv("VECTOR_BASELINE") != "true")
+            with subprocess.Popen(command, cwd=root, stdout=log, stderr=subprocess.PIPE, text=True,
+                                  errors="replace", start_new_session=True) as proc:
+                for line in proc.stderr:
+                    if side == "seed" and line.startswith("Warning: --semantic: cache ") and " not written:" in line:
+                        raise RuntimeError("jscpd could not persist the seed vectors")
+                    status = SEMANTIC_PROGRESS.fullmatch(line)
+                    if not status:
+                        log.write(line)
+                        continue
+                    print(f"{side}: {line.rstrip()}", flush=True)
+                    if bounded and int(status[1] or 0) > PR_MISS_LIMIT:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        emit("semantic_state", "limit")
+                        raise RuntimeError(f"{side}: exceeds the {PR_MISS_LIMIT}-function PR inference limit")
+                if proc.wait():
+                    raise subprocess.CalledProcessError(proc.returncode, command)
+        else:
+            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
+    if side == "seed":
+        return
     tracked = set(os.fsdecode(git("ls-files", "-z", cwd=root)).split("\0"))
     results = json.loads((output / "jscpd-report.sarif").read_text())["runs"][0]["results"]
     pairs = []
@@ -118,18 +139,22 @@ def main(mode):
     source = Path.cwd()
     tool = Path(os.environ["RUNNER_TEMP"]) / "jscpd"
     tree = tool / "base"
+    if mode in ("semantic", "seed"):
+        args = ["--semantic", "--semantic-provider", "local", "--semantic-model", os.environ["MODEL"],
+                "--kind", "semantic"]
+    if mode in ("exact", "seed"):
+        (tool / "config.json").write_text(json.dumps(config()))
+    if mode == "seed":
+        detect("semantic", tool, source, "seed", args)
+        return
     base = git("merge-base", os.environ["BASE"], "HEAD").decode().strip()
     head = git("rev-parse", "HEAD").decode().strip()
     if mode == "exact":
-        (tool / "config.json").write_text(json.dumps(config()))
         git("worktree", "add", "--quiet", "--detach", str(tree), base)
         args = ["--kind", "exact"]
     elif mode == "structural":
         args = ["--ignore-identifiers=consistent", "--ignore-literals", "--ignore-annotations",
                 "--max-gap-lines", "2", "--similarity=0.90", "--min-nodes", "40", "--kind", "renamed,gap,ast"]
-    else:
-        args = ["--semantic", "--semantic-provider", "local", "--semantic-model", os.environ["MODEL"],
-                "--kind", "semantic"]
     before = detect(mode, tool, tree, "base", args)
     if mode == "semantic":
         # jscpd keys vectors by canonical scan path. Switch revisions at one stable path.
