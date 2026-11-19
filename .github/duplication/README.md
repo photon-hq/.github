@@ -16,7 +16,7 @@ jobs:
 
 Use one trigger per target repository. For an organization-managed pilot, remove the repository caller first. Then have an organization owner select `photon-hq/.github` and `.github/workflows/report-duplicated-code.yml` at a reviewed revision in a standalone **Evaluate** branch ruleset. Target only the pilot repository and the PR base branches that should receive reports (for example, only `main`); PRs into other branches will not receive a ruleset report. Exclude `photon-hq/.github` from the targets because its own PRs already run the workflow directly.
 
-The workflow checks out the target PR's head for scanning and the defining workflow revision for its implementation.
+Creating the rule does not backfill open PRs. After cutover, update the branch or reopen an affected PR to trigger its report. The workflow scans the PR head using the implementation from the defining workflow revision.
 
 **Never use an Active required-workflow ruleset or require these status checks.** A merge must not wait for reporting, even if Actions is queued or unavailable. To roll back an Evaluate pilot, disable that rule before restoring the pinned repository caller.
 
