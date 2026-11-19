@@ -1,0 +1,148 @@
+# Organization setup: create a branch ruleset for all repositories and their default
+# branches. Require this workflow from photon-hq/.github at a reviewed commit SHA.
+# Repositories with no tracked JS/TS files do not receive a comment.
+name: Report duplicated code
+on:
+  pull_request:
+  merge_group:
+
+permissions: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+      report: ${{ steps.scan.outputs.report }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: github.event_name == 'pull_request'
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect tracked JS and TS
+        if: steps.checkout.outcome == 'success'
+        id: scope
+        continue-on-error: true
+        run: |
+          git ls-files -z -- '*.js' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts' > "$RUNNER_TEMP/js-files"
+          if [ -s "$RUNNER_TEMP/js-files" ]; then
+            echo 'scope=js' >> "$GITHUB_OUTPUT"
+          else
+            echo 'scope=skip' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan head against the merge base
+        if: steps.scope.outputs.scope == 'js'
+        id: scan
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base=$(git merge-base "$BASE" HEAD)
+          tool="$RUNNER_TEMP/jscpd"
+          mkdir -p "$tool"
+          (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save jscpd@5.4.3)
+          python3 -I - "$tool/config.json" <<'PY'
+          import json, pathlib, sys
+          config = {
+              'format': ['typescript', 'tsx', 'javascript', 'jsx'], 'mode': 'mild',
+              'minTokens': 50, 'minLines': 5,
+              'ignore': ['**/{node_modules,dist,generated,gen,test,tests,__tests__,fixtures}/**',
+                         '**/*.test.*', '**/*.spec.*'],
+          }
+          source = pathlib.Path('.jscpd.json')
+          if source.is_symlink():
+              sys.exit('Expected a regular .jscpd.json')
+          if source.is_file():
+              options = json.loads(source.read_text())
+              # Allow detection settings, not alternate input/output paths, plugins or network providers.
+              for key in (*config, 'pattern', 'maxLines', 'maxSize', 'ignorePattern', 'skipLocal'):
+                  if key in options:
+                      config[key] = options[key]
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(config))
+          PY
+          "$tool/node_modules/.bin/jscpd" . --config "$tool/config.json" --baseline-from-ref "$base" \
+            --reporters json --output "$tool" --absolute > "$tool/scan.log" 2>&1
+          python3 -I - "$tool/jscpd-report.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          clones = [d for d in report['duplicates'] if d['isNew']]
+          tracked = set(os.fsdecode(subprocess.check_output(['git', 'ls-files', '-z'])).split('\0'))
+          rows = []
+          for clone in sorted(clones, key=lambda d: -d['lines'])[:20]:
+              pair = []
+              for side in ('firstFile', 'secondFile'):
+                  f = clone[side]
+                  name = os.path.relpath(f['name'])
+                  if name not in tracked:
+                      sys.exit('Unexpected file in scanner output')
+                  pair.append([name, f['start'], f['end']])
+              rows.append(pair)
+          result = json.dumps({'count': len(clones), 'rows': rows}, separators=(',', ':'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('report=' + result, file=output)
+          PY
+
+  comment:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    concurrency:
+      group: jscpd-comment-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Publish the report
+        if: github.event_name == 'pull_request' && needs.scan.outputs.scope != 'skip'
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          REPORT: ${{ needs.scan.outputs.report }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const target = { ...context.repo, issue_number: pr.number };
+            const marker = '<!-- photon-jscpd -->';
+            const head = pr.head.sha;
+            let text = 'Scan unavailable. See the [workflow run](' +
+              `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`;
+            if (process.env.REPORT) {
+              const { count, rows } = JSON.parse(process.env.REPORT);
+              if (!Number.isSafeInteger(count) || count < 0 || rows.length !== Math.min(20, count)) {
+                throw new Error('Invalid clone count');
+              }
+              text = count ? `New clone pairs: **${count}**` : 'No new duplicated code.';
+              const link = ([file, start, end]) => {
+                if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start ||
+                    file.split('/').some(part => !part || part === '.' || part === '..')) {
+                  throw new Error('Invalid source location');
+                }
+                const name = file.split('/').map(part => encodeURIComponent(part)
+                  .replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16))).join('/');
+                return `[${name}:${start}-${end}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${name}#L${start}-L${end})`;
+              };
+              let shown = 0;
+              for (const [a, b] of rows) {
+                const line = `\n- ${link(a)} ↔ ${link(b)}`;
+                if (text.length + line.length > 60000) break;
+                text += line;
+                shown++;
+              }
+              if (shown < count) text += `\n\nShowing ${shown} of ${count} pairs.`;
+            }
+            const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
+            if (current.state !== 'open' || current.head.sha !== head) return;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
+            const old = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            const body = `${marker}\n### Duplicated code\n\n${text}`;
+            if (old) await github.rest.issues.updateComment({ ...context.repo, comment_id: old.id, body });
+            else await github.rest.issues.createComment({ ...target, body });
