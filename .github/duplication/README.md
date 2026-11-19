@@ -23,6 +23,8 @@ Creating the rule does not backfill open PRs. After cutover, update the branch o
 
 Before adopting a new workflow revision, verify that the repository where the run appears can use the Blacksmith x64 Ubuntu 24.04 runner. This applies to the source repository's own runs, pinned callers and Evaluate targets. An unavailable runner leaves the job queued. Same-repository PR scans and default-branch seeds use Blacksmith; fork PR scans and the comment publisher stay on GitHub-hosted runners. The runner change does not grant fork tokens permission to comment.
 
+The two providers keep separate model-weight caches even though they use the same Linux-X64 key. On a miss, the runner downloads and verifies the 548 MB public model. A new fork PR can miss even after a Blacksmith seed. The trusted vector snapshot is a GitHub run artifact, not an entry in either weight cache.
+
 The bot updates one comment, when the PR token permits it. The table always comes from two unnormalized jscpd 5.4.3 scans, followed by new locations:
 
 - **Type 1:** exact matching; by default at least 50 tokens and 5 lines, in mild mode.
