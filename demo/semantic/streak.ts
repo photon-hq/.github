@@ -1,5 +1,6 @@
 export function longestRun(values: readonly number[]): number {
   let longest = 0;
+  // Count adjacent equal values.
   let count = 0;
   let previous: number | undefined;
   for (const value of values) {
