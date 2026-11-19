@@ -14,7 +14,11 @@ jobs:
     uses: photon-hq/.github/.github/workflows/report-duplicated-code.yml@REVIEWED_SHA
 ```
 
-**Do not add this workflow to a required-workflow ruleset or mark its jobs as required status checks.** That way a merge never has to wait for reporting, even if Actions is queued, unavailable or canceled. Removing the optional caller stops delivery. This repository uses the same caller with a relative workflow path to test changes on its own PRs. There is no organization-wide enrollment.
+Use one trigger per target repository. For an organization-managed pilot, remove the repository caller first. Then have an organization owner select `photon-hq/.github` and `.github/workflows/report-duplicated-code.yml` at a reviewed revision in a standalone **Evaluate** branch ruleset. Target only the pilot repository and the PR base branches that should receive reports (for example, only `main`); PRs into other branches will not receive a ruleset report. Exclude `photon-hq/.github` from the targets because its own PRs already run the workflow directly.
+
+Creating the rule does not backfill open PRs. After cutover, update the branch or reopen an affected PR to trigger its report. The workflow scans the PR head using the implementation from the defining workflow revision.
+
+**Never use an Active required-workflow ruleset or require these status checks.** A merge must not wait for reporting, even if Actions is queued or unavailable. To roll back an Evaluate pilot, disable that rule before restoring the pinned repository caller.
 
 The bot updates one comment, when the PR token permits it. The table always comes from two unnormalized jscpd 5.4.3 scans, followed by new locations:
 
