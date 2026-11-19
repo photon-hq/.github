@@ -161,97 +161,87 @@ jobs:
               `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`;
             if (process.env.REPORT) {
               const { base, before, after, count, rows } = JSON.parse(process.env.REPORT);
-              if (!/^[0-9a-f]{40}$/.test(base) || !Number.isSafeInteger(count) || count < 0 ||
-                  rows.length !== Math.min(20, count)) {
-                throw new Error('Invalid revision or clone count');
-              }
+              const locationOK = f => Array.isArray(f) && typeof f[0] === 'string' &&
+                f[0].split('/').every(part => part && part !== '.' && part !== '..') &&
+                Number.isSafeInteger(f[1]) && Number.isSafeInteger(f[2]) && f[1] > 0 && f[2] >= f[1];
+              const valid = (g, scored) => Number.isSafeInteger(g?.count) && g.count >= 0 &&
+                Array.isArray(g.rows) && g.rows.length === Math.min(g.count, 20) &&
+                g.rows.every(([a, b, score]) => locationOK(a) && locationOK(b) && (!scored ||
+                  (Number.isFinite(score) && score >= -1 && score <= 1)));
+              if (!/^[0-9a-f]{40}$/.test(base) || !valid({ count, rows }, false)) throw new Error('Invalid exact report');
               const column = ({ percentage, duplicatedLines, clones, sources }) => {
                 if (!Number.isFinite(percentage) || percentage < 0 ||
                     ![duplicatedLines, clones, sources].every(n => Number.isSafeInteger(n) && n >= 0)) {
                   throw new Error('Invalid scan totals');
                 }
-                return sources ? [percentage.toFixed(2) + '%', duplicatedLines, clones, sources]
-                  : ['—', '—', '—', '0 (no files scanned)'];
+                return [sources ? `${duplicatedLines} (${percentage.toFixed(2)}%)` : '—', sources ? clones : '—', sources];
               };
               const left = column(before), right = column(after);
-              const validGroup = g => Number.isSafeInteger(g?.count) && g.count >= 0 &&
-                Array.isArray(g.rows) && g.rows.length === Math.min(20, g.count);
-              let findings;
-              if (process.env.STRUCTURAL) {
-                try {
-                  const parsed = JSON.parse(process.env.STRUCTURAL);
-                  if (['exact', 'renamed', 'gap', 'ast'].every(k => validGroup(parsed[k]))) findings = parsed;
-                } catch { /* Keep the exact-only report if the structural result is unavailable. */ }
-              }
-              const exact = findings?.exact ?? { count, rows };
               text = [
-                '| Metric | Before | After |',
-                '| --- | --- | --- |',
-                `| Revision | \`${base.slice(0, 7)}\` (merge base) | \`${head.slice(0, 7)}\` (PR head) |`,
-                ...['Duplicated lines (%)', 'Duplicate line count', 'Clone pairs', 'Scanned source files']
-                  .map((name, i) => `| ${name} | ${left[i]} | ${right[i]} |`),
-                '',
-                count === 0 ? 'No new duplicated code. (Type 1)' :
-                  exact.count ? `New clone pairs: **${exact.count}** (Type 1 · exact)` :
-                  'New exact blocks are included in the wider matches below.',
+                `| Exact duplication | Before \`${base.slice(0, 7)}\` | After \`${head.slice(0, 7)}\` |`,
+                '| --- | ---: | ---: |',
+                ...['Duplicated lines', 'Clone pairs', 'Scanned files'].map((name, i) => `| ${name} | ${left[i]} | ${right[i]} |`),
               ].join('\n');
-              const link = ([file, start, end]) => {
-                if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start ||
-                    file.split('/').some(part => !part || part === '.' || part === '..')) {
-                  throw new Error('Invalid source location');
-                }
-                const name = file.split('/').map(part => encodeURIComponent(part)
-                  .replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16))).join('/');
-                return `[${name}:${start}-${end}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${name}#L${start}-L${end})`;
-              };
-              const list = (pairs, total, budget, semantic = false) => {
-                let lines = '', shown = 0;
-                for (const [a, b, score] of pairs) {
-                  if (semantic && (!Number.isFinite(score) || score < -1 || score > 1)) {
-                    throw new Error('Invalid similarity');
-                  }
-                  const line = `\n- ${link(a)} ↔ ${link(b)}` + (semantic ? ` (similarity: ${score.toFixed(3)})` : '');
-                  if (lines.length + line.length > budget) break;
-                  lines += line;
-                  shown++;
-                }
-                return lines + (shown < total ? `\n\nShowing ${shown} of ${total} pairs.` : '');
-              };
-              text += list(exact.rows, exact.count, 42000 - text.length);
-              if (count !== exact.count) text += '\n\nExact spans inside a wider match are counted in the table and linked once below.';
-              text += '\n\n### Renamed and near-miss clones\n\n';
+
+              const notes = [];
+              let groups = [['Exact', { count, rows }]];
               if (process.env.STRUCTURE_STATE === 'unchanged' || process.env.STRUCTURE_STATE === 'empty') {
-                text += 'Skipped: no changed scan inputs or no scanned files.';
+                notes.push('structural scan skipped');
               } else {
                 try {
-                  if (!findings) throw new Error('Missing structural report');
-                  const sections = [];
-                  for (const [kind, title] of [['renamed', 'Type 2 · renamed'], ['gap', 'Type 3 · small gaps'], ['ast', 'Type 3 · similar syntax trees']]) {
-                    const group = findings[kind];
-                    if (group.count) sections.push(`**${title}: ${group.count}**` + list(group.rows, group.count, 4500));
+                  const { exact, renamed, gap, ast } = JSON.parse(process.env.STRUCTURAL);
+                  if (!valid(exact, false) || !valid(renamed, false) || !valid(gap, true) || !valid(ast, true)) {
+                    throw new Error('Invalid structural report');
                   }
-                  text += sections.join('\n\n') || 'No new renamed or near-miss clones.';
+                  groups = [['Exact', exact], ['Renamed', renamed], ['Gap', gap], ['AST', ast]];
                 } catch {
-                  text += 'Renamed/near-miss scan unavailable. The exact results above are unaffected.';
+                  notes.push('structural scan unavailable');
                 }
               }
-              text += '\n\n### Semantic candidates (experimental)\n\n';
-              if (process.env.ELIGIBILITY === 'unchanged') {
-                text += 'Skipped: no JS/TS or scan-input changes since the merge base.';
-              } else if (process.env.ELIGIBILITY === 'too-few-files') {
-                text += 'Skipped: fewer than two scanned JS/TS files.';
+              if (process.env.ELIGIBILITY === 'unchanged' || process.env.ELIGIBILITY === 'too-few-files') {
+                notes.push('semantic scan skipped');
               } else {
                 try {
                   const candidates = JSON.parse(process.env.SEMANTIC);
-                  if (!validGroup(candidates)) throw new Error('Invalid candidates');
-                  text += candidates.count
-                    ? `New candidates: **${candidates.count}**. Review for similar behavior; these are not exact duplicates.` +
-                      list(candidates.rows, candidates.count, 64000 - text.length, true)
-                    : 'No new semantic candidates.';
+                  if (!valid(candidates, true)) throw new Error('Invalid semantic report');
+                  groups.push(['Semantic candidate', candidates]);
                 } catch {
-                  text += 'Semantic scan unavailable. The exact results above are unaffected.';
+                  notes.push('semantic scan unavailable');
                 }
               }
+              const total = groups.reduce((n, [, group]) => n + group.count, 0);
+              const findings = groups.flatMap(([kind, group]) => group.rows.map(([a, b, score]) => ({ kind, a, b, score })));
+              const files = [...new Set(findings.flatMap(({ a, b }) => [a[0], b[0]]))];
+              const link = ([file, start, end]) => {
+                const parts = file.split('/');
+                let short = parts.at(-1);
+                for (let i = parts.length - 2; i >= 0 && files.some(f => f !== file && (f === short || f.endsWith('/' + short))); i--) {
+                  short = parts[i] + '/' + short;
+                }
+                const escape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                  .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, c => encodeURIComponent(c));
+                const path = parts.map(part => encodeURIComponent(part).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16))).join('/');
+                const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${path}#L${start}-L${end}`;
+                return `<a href="${url}"><code>${escape(short)}:${start}–${end}</code></a>`;
+              };
+              const lines = [];
+              let budget = 62000 - text.length;
+              for (const { kind, a, b, score } of findings) {
+                const similarity = score === undefined ? '' : ` · similarity ${score.toFixed(3)}`;
+                const line = `- **${kind}**${similarity}: ${link(a)} ↔ ${link(b)}`;
+                if (line.length > budget) break;
+                lines.push(line);
+                budget -= line.length + 1;
+              }
+              const status = !after.sources ? 'No eligible JS/TS files in this revision' :
+                total ? `**${total} new ${total === 1 ? 'finding' : 'findings'}**` :
+                notes.length ? 'No new findings in completed scans' : 'No new duplication or semantic candidates';
+              text += '\n\n' + [status, ...notes].join(' · ') + '.';
+              if (lines.length) text += '\n\n' + lines.slice(0, 5).join('\n');
+              if (total > 5 && lines.length > 5) {
+                text += `\n\n<details><summary>${lines.length - 5} more shown</summary>\n\n${lines.slice(5).join('\n')}\n\n</details>`;
+              }
+              if (lines.length < total) text += `\n\nShowing ${lines.length} of ${total} findings.`;
             }
             const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
             if (current.state !== 'open' || current.head.sha !== head) return;
