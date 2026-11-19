@@ -185,7 +185,7 @@ jobs:
 
               const notes = [];
               let groups = [['Exact', { count, rows }]];
-              if (process.env.STRUCTURE_STATE === 'unchanged' || process.env.STRUCTURE_STATE === 'empty') {
+              if (process.env.STRUCTURE_STATE === 'unchanged') {
                 notes.push('structural scan skipped');
               } else {
                 try {
@@ -233,8 +233,8 @@ jobs:
                 lines.push(line);
                 budget -= line.length + 1;
               }
-              const status = !after.sources ? 'No eligible JS/TS files in this revision' :
-                total ? `**${total} new ${total === 1 ? 'finding' : 'findings'}**` :
+              const status = total ? `**${total} new ${total === 1 ? 'finding' : 'findings'}**` :
+                !after.sources ? 'No files met the exact scan criteria' :
                 notes.length ? 'No new findings in completed scans' : 'No new duplication or semantic candidates';
               text += '\n\n' + [status, ...notes].join(' · ') + '.';
               if (lines.length) text += '\n\n' + lines.slice(0, 5).join('\n');

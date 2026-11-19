@@ -1,7 +1,9 @@
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -9,6 +11,46 @@ from scan import added, detect, grouped
 
 
 class ClassificationTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("jscpd"), "requires jscpd 5.4.3 on PATH")
+    def test_structural_schedule_with_no_exact_sources(self):
+        fixtures = Path(__file__).resolve().parents[1] / "tests/fixtures"
+        script = Path(__file__).with_name("scan.py").resolve()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            subprocess.run(["git", "init", "-q", root], check=True)
+            env = {**os.environ, "EMAIL": "fixture@example.invalid"}
+            def commit():
+                subprocess.run(["git", "add", "."], cwd=root, check=True)
+                subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, env=env, check=True)
+                return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            def scan(mode):
+                output = Path(env["GITHUB_OUTPUT"])
+                output.write_text("")
+                subprocess.run([sys.executable, "-I", script, mode], cwd=root, env=env, check=True)
+                return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+            (root / ".jscpd.json").write_text('{"minTokens":10000}')
+            shutil.copyfile(fixtures / "spectral-ledger.js.txt", root / "original.js")
+            base = commit()
+            shutil.copyfile(fixtures / "spectral-ledger-alt.js.txt", root / "candidate.js")
+            code_head = commit()
+            for name, parent, state in (("code", base, "run"), ("docs", code_head, "unchanged")):
+                if name == "docs":
+                    (root / "README.md").write_text("Docs only.")
+                    commit()
+                runner = Path(tmp) / name
+                bin_dir = runner / "jscpd/node_modules/.bin"
+                bin_dir.mkdir(parents=True)
+                (bin_dir / "jscpd").symlink_to(shutil.which("jscpd"))
+                env.update(BASE=parent, RUNNER_TEMP=str(runner), GITHUB_OUTPUT=str(runner / "outputs"))
+                exact = scan("exact")
+                self.assertEqual(json.loads(exact["report"])["after"]["sources"], 0)
+                self.assertEqual(exact["structural"], state)
+                if exact["structural"] == "run":
+                    ast = json.loads(scan("structural")["structural"])["ast"]
+                    self.assertEqual(ast["count"], 1)
+                    self.assertEqual(ast["rows"][0], [["candidate.js", 1, 14], ["original.js", 1, 14], 0.967])
+
     @unittest.skipUnless(shutil.which("jscpd"), "requires jscpd 5.4.3 on PATH")
     def test_relative_ignore_globs_do_not_exclude_the_base_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:

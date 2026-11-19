@@ -160,7 +160,7 @@ def main(mode):
         relevant = any(p.lower().endswith(JS_SUFFIXES) or p.split(b"/")[-1] in (
             b".gitignore", b".ignore", b".jscpd.json", b".gitattributes") for p in changes)
         state = "run" if relevant else "unchanged"
-        emit("structural", state if head_stats["sources"] else "empty")
+        emit("structural", state)
         emit("eligibility", state if head_stats["sources"] >= 2 else "too-few-files")
     else:
         emit(mode, json.dumps(groups["semantic"] if mode == "semantic" else groups, separators=(",", ":")))
