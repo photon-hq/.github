@@ -1,0 +1,256 @@
+# Optional report for pull_request callers. Never require this workflow or its checks for merge.
+name: Report duplicated code
+on: workflow_call
+
+permissions: {}
+concurrency:
+  group: report-duplicated-code-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  JSCPD_VERSION: '5.4.3'
+  MODEL: CodeRankEmbed
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: source
+    env:
+      BASE: ${{ github.event.pull_request.base.sha }}
+    outputs:
+      structural: ${{ steps.structural.outputs.structural }}
+      structure_state: ${{ steps.scan.outputs.structural }}
+      scope: ${{ steps.scope.outputs.scope }}
+      report: ${{ steps.scan.outputs.report }}
+      semantic: ${{ steps.semantic.outputs.semantic }}
+      eligibility: ${{ steps.scan.outputs.eligibility }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: github.event_name == 'pull_request'
+        id: checkout
+        continue-on-error: true
+        with:
+          path: source
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect tracked JS and TS
+        if: steps.checkout.outcome == 'success'
+        id: scope
+        continue-on-error: true
+        run: |
+          git ls-files -z -- '*.js' '*.es' '*.es6' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts' > "$RUNNER_TEMP/js-files"
+          if [ -s "$RUNNER_TEMP/js-files" ]; then
+            echo 'scope=js' >> "$GITHUB_OUTPUT"
+          else
+            echo 'scope=skip' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the report implementation at the caller's pin
+        if: steps.scope.outputs.scope == 'js' && job.workflow_sha != ''
+        id: implementation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        continue-on-error: true
+        with:
+          repository: photon-hq/.github
+          ref: ${{ job.workflow_sha }}
+          path: policy
+          sparse-checkout: .github/duplication
+          persist-credentials: false
+
+      - name: Scan exact duplicates
+        if: steps.implementation.outcome == 'success'
+        id: scan
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          tool="$RUNNER_TEMP/jscpd"
+          mkdir -p "$tool"
+          (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save "jscpd@$JSCPD_VERSION")
+          python3 -I ../policy/.github/duplication/scan.py exact
+          echo "family=jscpd-v1-$RUNNER_OS-$RUNNER_ARCH-$JSCPD_VERSION-$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: Compare renamed and near-miss clones
+        if: steps.scan.outputs.structural == 'run'
+        id: structural
+        continue-on-error: true
+        timeout-minutes: 8
+        run: python3 -I ../policy/.github/duplication/scan.py structural
+
+      - name: Restore public model weights
+        if: steps.scan.outputs.eligibility == 'run'
+        id: weights
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/models/nomic-ai--CodeRankEmbed
+          key: ${{ steps.scan.outputs.family }}-weights
+
+      - name: Prepare the local CPU model
+        if: steps.scan.outputs.eligibility == 'run'
+        id: model
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          cd "$RUNNER_TEMP/jscpd"
+          node_modules/.bin/jscpd --semantic-download "$MODEL"
+
+      - name: Save verified weights on a cache miss
+        if: steps.model.outcome == 'success' && steps.weights.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/models/nomic-ai--CodeRankEmbed
+          key: ${{ steps.scan.outputs.family }}-weights
+
+      - name: Restore vectors from this PR
+        if: steps.model.outcome == 'success'
+        id: vectors
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/embeddings
+          key: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-
+
+      - name: Find new semantic candidates (local CPU)
+        if: steps.model.outcome == 'success'
+        id: semantic
+        continue-on-error: true
+        timeout-minutes: 12
+        run: python3 -I ../policy/.github/duplication/scan.py semantic
+
+      - name: Save updated vectors for the next push
+        if: steps.semantic.outcome == 'success' && steps.semantic.outputs.embedded == 'true' && steps.vectors.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/embeddings
+          key: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+
+  comment:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Publish the report
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          SCOPE: ${{ needs.scan.outputs.scope }}
+          REPORT: ${{ needs.scan.outputs.report }}
+          STRUCTURAL: ${{ needs.scan.outputs.structural }}
+          STRUCTURE_STATE: ${{ needs.scan.outputs.structure_state }}
+          ELIGIBILITY: ${{ needs.scan.outputs.eligibility }}
+          SEMANTIC: ${{ needs.scan.outputs.semantic }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const target = { ...context.repo, issue_number: pr.number };
+            const marker = '<!-- photon-jscpd -->';
+            const head = pr.head.sha;
+            let text = 'Scan unavailable. See the [workflow run](' +
+              `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`;
+            if (process.env.REPORT) {
+              const { base, before, after, count, rows } = JSON.parse(process.env.REPORT);
+              const locationOK = f => Array.isArray(f) && typeof f[0] === 'string' &&
+                f[0].split('/').every(part => part && part !== '.' && part !== '..') &&
+                Number.isSafeInteger(f[1]) && Number.isSafeInteger(f[2]) && f[1] > 0 && f[2] >= f[1];
+              const valid = (g, scored) => Number.isSafeInteger(g?.count) && g.count >= 0 &&
+                Array.isArray(g.rows) && g.rows.length === Math.min(g.count, 20) &&
+                g.rows.every(([a, b, score]) => locationOK(a) && locationOK(b) && (!scored ||
+                  (Number.isFinite(score) && score >= -1 && score <= 1)));
+              if (!/^[0-9a-f]{40}$/.test(base) || !valid({ count, rows }, false)) throw new Error('Invalid exact report');
+              const column = ({ percentage, duplicatedLines, clones, sources }) => {
+                if (!Number.isFinite(percentage) || percentage < 0 ||
+                    ![duplicatedLines, clones, sources].every(n => Number.isSafeInteger(n) && n >= 0)) {
+                  throw new Error('Invalid scan totals');
+                }
+                return [sources ? `${duplicatedLines} (${percentage.toFixed(2)}%)` : '—', sources ? clones : '—', sources];
+              };
+              const left = column(before), right = column(after);
+              text = [
+                `| Exact duplication | Before \`${base.slice(0, 7)}\` | After \`${head.slice(0, 7)}\` |`,
+                '| --- | ---: | ---: |',
+                ...['Duplicated lines', 'Clone pairs', 'Scanned files'].map((name, i) => `| ${name} | ${left[i]} | ${right[i]} |`),
+              ].join('\n');
+
+              const notes = [];
+              let groups = [['Exact', { count, rows }]];
+              if (process.env.STRUCTURE_STATE === 'unchanged') {
+                notes.push('structural scan skipped');
+              } else {
+                try {
+                  const { exact, renamed, gap, ast } = JSON.parse(process.env.STRUCTURAL);
+                  if (!valid(exact, false) || !valid(renamed, false) || !valid(gap, true) || !valid(ast, true)) {
+                    throw new Error('Invalid structural report');
+                  }
+                  groups = [['Exact', exact], ['Renamed', renamed], ['Gap', gap], ['AST', ast]];
+                } catch {
+                  notes.push('structural scan unavailable');
+                }
+              }
+              if (process.env.ELIGIBILITY === 'unchanged' || process.env.ELIGIBILITY === 'too-few-files') {
+                notes.push('semantic scan skipped');
+              } else {
+                try {
+                  const candidates = JSON.parse(process.env.SEMANTIC);
+                  if (!valid(candidates, true)) throw new Error('Invalid semantic report');
+                  groups.push(['Semantic candidate', candidates]);
+                } catch {
+                  notes.push('semantic scan unavailable');
+                }
+              }
+              const total = groups.reduce((n, [, group]) => n + group.count, 0);
+              const findings = groups.flatMap(([kind, group]) => group.rows.map(([a, b, score]) => ({ kind, a, b, score })));
+              const files = [...new Set(findings.flatMap(({ a, b }) => [a[0], b[0]]))];
+              const link = ([file, start, end]) => {
+                const parts = file.split('/');
+                let short = parts.at(-1);
+                for (let i = parts.length - 2; i >= 0 && files.some(f => f !== file && (f === short || f.endsWith('/' + short))); i--) {
+                  short = parts[i] + '/' + short;
+                }
+                const escape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                  .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, c => encodeURIComponent(c));
+                const path = parts.map(part => encodeURIComponent(part).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16))).join('/');
+                const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${path}#L${start}-L${end}`;
+                return `<a href="${url}"><code>${escape(short)}:${start}–${end}</code></a>`;
+              };
+              const lines = [];
+              let budget = 62000 - text.length;
+              for (const { kind, a, b, score } of findings) {
+                const similarity = score === undefined ? '' : ` · similarity ${score.toFixed(3)}`;
+                const line = `- **${kind}**${similarity}: ${link(a)} ↔ ${link(b)}`;
+                if (line.length > budget) break;
+                lines.push(line);
+                budget -= line.length + 1;
+              }
+              const status = total ? `**${total} new ${total === 1 ? 'finding' : 'findings'}**` :
+                !after.sources ? 'No files met the exact scan criteria' :
+                notes.length ? 'No new findings in completed scans' : 'No new duplication or semantic candidates';
+              text += '\n\n' + [status, ...notes].join(' · ') + '.';
+              if (lines.length) text += '\n\n' + lines.slice(0, 5).join('\n');
+              if (total > 5 && lines.length > 5) {
+                text += `\n\n<details><summary>${lines.length - 5} more shown</summary>\n\n${lines.slice(5).join('\n')}\n\n</details>`;
+              }
+              if (lines.length < total) text += `\n\nShowing ${lines.length} of ${total} findings.`;
+            }
+            const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
+            if (current.state !== 'open' || current.head.sha !== head) return;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
+            const old = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            if (process.env.SCOPE === 'skip') {
+              if (old) await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+              return;
+            }
+            const body = `${marker}\n### Duplicated code\n\n${text}`;
+            if (old) await github.rest.issues.updateComment({ ...context.repo, comment_id: old.id, body });
+            else await github.rest.issues.createComment({ ...target, body });

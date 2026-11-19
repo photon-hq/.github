@@ -1,0 +1,10 @@
+# Optional caller. Do not select this workflow or its checks as merge requirements.
+name: Duplication report
+on: pull_request
+permissions: {}
+jobs:
+  report:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/report-duplicated-code.yml
