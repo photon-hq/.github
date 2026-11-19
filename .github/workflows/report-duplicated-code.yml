@@ -102,10 +102,11 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Publish the report
-        if: github.event_name == 'pull_request' && needs.scan.outputs.scope != 'skip'
+        if: github.event_name == 'pull_request'
         continue-on-error: true
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
+          SCOPE: ${{ needs.scan.outputs.scope }}
           REPORT: ${{ needs.scan.outputs.report }}
         with:
           script: |
@@ -143,6 +144,10 @@ jobs:
             if (current.state !== 'open' || current.head.sha !== head) return;
             const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
             const old = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            if (process.env.SCOPE === 'skip') {
+              if (old) await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+              return;
+            }
             const body = `${marker}\n### Duplicated code\n\n${text}`;
             if (old) await github.rest.issues.updateComment({ ...context.repo, comment_id: old.id, body });
             else await github.rest.issues.createComment({ ...target, body });

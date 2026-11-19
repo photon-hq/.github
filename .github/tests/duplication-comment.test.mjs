@@ -35,3 +35,34 @@ test('one report is created, updated on a clean push, and not overwritten by a s
   assert.equal(comments.length, 1);
   assert.match(comments[0].body, /Scan unavailable/);
 });
+
+test('dropping JS/TS removes only the current report, and a second run is a no-op', async () => {
+  const marker = '<!-- photon-jscpd -->';
+  const bot = { login: 'github-actions[bot]' };
+  const other = [
+    { id: 1, user: { login: 'contributor' }, body: marker },
+    { id: 2, user: bot, body: 'A different check' },
+  ];
+  let comments = [...other, { id: 3, user: bot, body: marker + '\nNew clone pairs: **1**' }];
+  const pr = { number: 7, head: { sha: 'last-js-removed' } };
+  const context = { repo: { owner: 'example', repo: 'demo' }, payload: { pull_request: pr } };
+  let current = { state: 'open', head: { sha: 'newer' } };
+  const github = {
+    paginate: async () => comments,
+    rest: {
+      pulls: { get: async () => ({ data: current }) },
+      issues: { deleteComment: async ({ comment_id }) => {
+        assert.equal(comment_id, 3);
+        comments = comments.filter(c => c.id !== comment_id);
+      } },
+    },
+  };
+  const skip = () => publish(context, github, { env: { SCOPE: 'skip' } });
+  await skip();
+  assert.equal(comments.length, 3);
+  current = { state: 'open', head: pr.head };
+  await skip();
+  assert.deepEqual(comments, other);
+  await skip();
+  assert.deepEqual(comments, other);
+});
