@@ -126,7 +126,7 @@ jobs:
         run: python3 -I ../policy/.github/duplication/scan.py semantic
 
       - name: Save updated vectors for the next push
-        if: steps.semantic.outcome == 'success' && steps.vectors.outputs.cache-hit != 'true'
+        if: steps.semantic.outcome == 'success' && steps.semantic.outputs.embedded == 'true' && steps.vectors.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
@@ -218,18 +218,20 @@ jobs:
                 return lines + (shown < total ? `\n\nShowing ${shown} of ${total} pairs.` : '');
               };
               text += list(exact.rows, exact.count, 42000 - text.length);
+              if (count !== exact.count) text += '\n\nExact spans inside a wider match are counted in the table and linked once below.';
               text += '\n\n### Renamed and near-miss clones\n\n';
               if (process.env.STRUCTURE_STATE === 'unchanged' || process.env.STRUCTURE_STATE === 'empty') {
                 text += 'Skipped: no changed scan inputs or no scanned files.';
               } else {
-                if (findings) {
+                try {
+                  if (!findings) throw new Error('Missing structural report');
                   const sections = [];
                   for (const [kind, title] of [['renamed', 'Type 2 · renamed'], ['gap', 'Type 3 · small gaps'], ['ast', 'Type 3 · similar syntax trees']]) {
                     const group = findings[kind];
                     if (group.count) sections.push(`**${title}: ${group.count}**` + list(group.rows, group.count, 4500));
                   }
                   text += sections.join('\n\n') || 'No new renamed or near-miss clones.';
-                } else {
+                } catch {
                   text += 'Renamed/near-miss scan unavailable. The exact results above are unaffected.';
                 }
               }

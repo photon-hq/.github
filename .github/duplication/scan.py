@@ -60,6 +60,8 @@ def detect(mode, tool, root, side, args):
             for line in log:
                 if re.fullmatch(r"Semantic clones \(experimental\): (?:embedding \d+(?: of \d+)? functions with nomic-ai/CodeRankEmbed on this machine(?:, the rest cached)?|\d+ functions, all embeddings cached \(nomic-ai/CodeRankEmbed\))\n", line):
                     print(f"{side}: {line.rstrip()}")
+                    if "all embeddings cached" not in line:
+                        emit("embedded", "true")
     tracked = set(os.fsdecode(git("ls-files", "-z", cwd=root)).split("\0"))
     results = json.loads((output / "jscpd-report.sarif").read_text())["runs"][0]["results"]
     pairs = []
