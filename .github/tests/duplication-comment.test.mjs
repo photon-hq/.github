@@ -23,11 +23,25 @@ test('one report is created, updated on a clean push, and not overwritten by a s
       },
     },
   };
-  const scan = async (count, rows) => publish(context, github, { env: { REPORT: JSON.stringify({ count, rows }) } });
-  await scan(1, [[['a #1.ts', 1, 8], ['b.ts', 4, 11]]]);
+  const existing = { percentage: 20, duplicatedLines: 10, clones: 1, sources: 3 };
+  const larger = { percentage: 28.5714, duplicatedLines: 20, clones: 2, sources: 4 };
+  const empty = { percentage: 0, duplicatedLines: 0, clones: 0, sources: 0 };
+  const scan = (count, rows, before = existing, after = existing) => publish(context, github, {
+    env: { REPORT: JSON.stringify({ base: 'b'.repeat(40), before, after, count, rows }) },
+  });
+  await scan(1, [[['a #1.ts', 1, 8], ['b.ts', 4, 11]]], existing, larger);
+  assert.ok(comments[0].body.includes([
+    '### Duplicated code', '', '| Metric | Before | After |', '| --- | --- | --- |',
+    '| Revision | `bbbbbbb` (merge base) | `abc` (PR head) |',
+    '| Duplicated lines (%) | 20.00% | 28.57% |', '| Duplicate line count | 10 | 20 |',
+    '| Clone pairs | 1 | 2 |', '| Scanned source files | 3 | 4 |', '', 'New clone pairs: **1**',
+  ].join('\n')));
   assert.match(comments[0].body, /a%20%231\.ts#L1-L8/);
   await scan(0, []);
-  assert.match(comments[0].body, /No new duplicated code\./);
+  assert.ok(comments[0].body.includes('| Scanned source files | 3 | 3 |\n\nNo new duplicated code.'));
+  await scan(0, [], empty, empty);
+  assert.ok(comments[0].body.includes('| Duplicated lines (%) | — | — |'));
+  assert.ok(comments[0].body.includes('| Scanned source files | 0 (no files scanned) | 0 (no files scanned) |'));
   await publish(context, github, { env: {} });
   assert.match(comments[0].body, /Scan unavailable/);
   context.payload.pull_request = { ...pr, head: { sha: 'old' } };

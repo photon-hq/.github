@@ -69,11 +69,18 @@ jobs:
                       config[key] = options[key]
           pathlib.Path(sys.argv[1]).write_text(json.dumps(config))
           PY
-          "$tool/node_modules/.bin/jscpd" . --config "$tool/config.json" --baseline-from-ref "$base" \
-            --reporters json --output "$tool" --absolute > "$tool/scan.log" 2>&1
-          python3 -I - "$tool/jscpd-report.json" <<'PY'
+          git worktree add --quiet --detach "$tool/base" "$base"
+          scan=("$tool/node_modules/.bin/jscpd" . --config "$tool/config.json" --baseline "$tool/baseline.json" --reporters json --absolute)
+          (cd "$tool/base" && "${scan[@]}" --update-baseline --output "$tool/before") > "$tool/base.log" 2>&1
+          test -f "$tool/baseline.json"
+          "${scan[@]}" --output "$tool/after" > "$tool/head.log" 2>&1
+          python3 -I - "$tool" "$base" <<'PY'
           import json, os, pathlib, subprocess, sys
-          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          tool = pathlib.Path(sys.argv[1])
+          def totals(report):
+              return {k: report['statistics']['total'][k] for k in ('percentage', 'duplicatedLines', 'clones', 'sources')}
+          before = totals(json.loads((tool / 'before/jscpd-report.json').read_text()))
+          report = json.loads((tool / 'after/jscpd-report.json').read_text())
           clones = [d for d in report['duplicates'] if d['isNew']]
           tracked = set(os.fsdecode(subprocess.check_output(['git', 'ls-files', '-z'])).split('\0'))
           rows = []
@@ -86,7 +93,8 @@ jobs:
                       sys.exit('Unexpected file in scanner output')
                   pair.append([name, f['start'], f['end']])
               rows.append(pair)
-          result = json.dumps({'count': len(clones), 'rows': rows}, separators=(',', ':'))
+          result = json.dumps({'base': sys.argv[2], 'before': before, 'after': totals(report),
+                               'count': len(clones), 'rows': rows}, separators=(',', ':'))
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print('report=' + result, file=output)
           PY
@@ -117,11 +125,29 @@ jobs:
             let text = 'Scan unavailable. See the [workflow run](' +
               `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`;
             if (process.env.REPORT) {
-              const { count, rows } = JSON.parse(process.env.REPORT);
-              if (!Number.isSafeInteger(count) || count < 0 || rows.length !== Math.min(20, count)) {
-                throw new Error('Invalid clone count');
+              const { base, before, after, count, rows } = JSON.parse(process.env.REPORT);
+              if (!/^[0-9a-f]{40}$/.test(base) || !Number.isSafeInteger(count) || count < 0 ||
+                  rows.length !== Math.min(20, count)) {
+                throw new Error('Invalid revision or clone count');
               }
-              text = count ? `New clone pairs: **${count}**` : 'No new duplicated code.';
+              const column = ({ percentage, duplicatedLines, clones, sources }) => {
+                if (!Number.isFinite(percentage) || percentage < 0 ||
+                    ![duplicatedLines, clones, sources].every(n => Number.isSafeInteger(n) && n >= 0)) {
+                  throw new Error('Invalid scan totals');
+                }
+                return sources ? [percentage.toFixed(2) + '%', duplicatedLines, clones, sources]
+                  : ['—', '—', '—', '0 (no files scanned)'];
+              };
+              const left = column(before), right = column(after);
+              text = [
+                '| Metric | Before | After |',
+                '| --- | --- | --- |',
+                `| Revision | \`${base.slice(0, 7)}\` (merge base) | \`${head.slice(0, 7)}\` (PR head) |`,
+                ...['Duplicated lines (%)', 'Duplicate line count', 'Clone pairs', 'Scanned source files']
+                  .map((name, i) => `| ${name} | ${left[i]} | ${right[i]} |`),
+                '',
+                count ? `New clone pairs: **${count}**` : 'No new duplicated code.',
+              ].join('\n');
               const link = ([file, start, end]) => {
                 if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start ||
                     file.split('/').some(part => !part || part === '.' || part === '..')) {
