@@ -14,7 +14,7 @@ env:
 
 jobs:
   scan:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.id && github.event.pull_request.head.repo.id == github.event.repository.id && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     permissions:
       contents: read
       actions: read
