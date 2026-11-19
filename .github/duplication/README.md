@@ -21,6 +21,8 @@ Creating the rule does not backfill open PRs. After cutover, update the branch o
 
 **Never use an Active required-workflow ruleset or require these status checks.** A merge must not wait for reporting, even if Actions is queued or unavailable. To roll back an Evaluate pilot, disable that rule before restoring the pinned repository caller.
 
+Before adopting a new workflow revision, verify that the repository where the run appears can use the Blacksmith x64 Ubuntu 24.04 runner. This applies to the source repository's own runs, pinned callers and Evaluate targets. An unavailable runner leaves the job queued. Same-repository PR scans and default-branch seeds use Blacksmith; fork PR scans and the comment publisher stay on GitHub-hosted runners. The runner change does not grant fork tokens permission to comment.
+
 The bot updates one comment, when the PR token permits it. The table always comes from two unnormalized jscpd 5.4.3 scans, followed by new locations:
 
 - **Type 1:** exact matching; by default at least 50 tokens and 5 lines, in mild mode.
