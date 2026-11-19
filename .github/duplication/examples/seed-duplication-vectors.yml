@@ -1,0 +1,13 @@
+# Install as .github/workflows/seed-duplication-vectors.yml. Use the repository's default branch.
+name: Seed duplication vectors
+run-name: Seed vectors on ${{ github.ref }}
+on:
+  push:
+    branches: [main]
+permissions: {}
+jobs:
+  seed:
+    permissions:
+      actions: read
+      contents: read
+    uses: photon-hq/.github/.github/workflows/seed-duplication-vectors.yml@REVIEWED_SHA

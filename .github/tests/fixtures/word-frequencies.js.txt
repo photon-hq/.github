@@ -1,0 +1,9 @@
+export function wordFrequencies(text) {
+  const words = text.toLowerCase().match(/[a-z]+/g) ?? [];
+  const counts = new Map();
+  for (const word of words) {
+    const previous = counts.get(word) ?? 0;
+    counts.set(word, previous + 1);
+  }
+  return counts;
+}

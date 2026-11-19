@@ -1,0 +1,7 @@
+export function wordHistogram(text) {
+  const words = text.toLowerCase().match(/[a-z]+/g) || [];
+  return words.reduce((counts, word) => {
+    const previous = counts.get(word) || 0;
+    return counts.set(word, previous + 1);
+  }, new Map());
+}

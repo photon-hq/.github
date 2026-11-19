@@ -48,6 +48,8 @@ test('one report is created, updated on a clean push, and not overwritten by a s
   assert.ok(comments[0].body.endsWith('| Scanned files | 3 | 3 |\n\nNo new duplication or semantic candidates.'));
   await scan(0, []);
   assert.match(comments[0].body, /No new findings in completed scans · structural scan unavailable · semantic scan unavailable/);
+  await scan(0, [], existing, existing, { ...clean, SEMANTIC: '', SEMANTIC_STATE: 'limit' });
+  assert.match(comments[0].body, /No new findings in completed scans · semantic scan incomplete \(inference limit\)/);
   await scan(0, [], empty, empty, { STRUCTURE_STATE: 'unchanged', ELIGIBILITY: 'too-few-files' });
   assert.ok(comments[0].body.endsWith('| Scanned files | 0 | 0 |\n\nNo files met the exact scan criteria · structural scan skipped · semantic scan skipped.'));
   await scan(0, [], empty, empty, { ELIGIBILITY: 'too-few-files', STRUCTURAL: JSON.stringify({
