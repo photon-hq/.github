@@ -26,10 +26,17 @@ test('one report is created, updated on a clean push, and not overwritten by a s
   const existing = { percentage: 20, duplicatedLines: 10, clones: 1, sources: 3 };
   const larger = { percentage: 28.5714, duplicatedLines: 20, clones: 2, sources: 4 };
   const empty = { percentage: 0, duplicatedLines: 0, clones: 0, sources: 0 };
-  const scan = (count, rows, before = existing, after = existing) => publish(context, github, {
-    env: { REPORT: JSON.stringify({ base: 'b'.repeat(40), before, after, count, rows }) },
+  const scan = (count, rows, before = existing, after = existing, env = {}) => publish(context, github, {
+    env: { REPORT: JSON.stringify({ base: 'b'.repeat(40), before, after, count, rows }), ...env },
   });
-  await scan(1, [[['a #1.ts', 1, 8], ['b.ts', 4, 11]]], existing, larger);
+  const semantic = { count: 1, rows: [[['one.ts', 2, 12], ['two.ts', 3, 14], 0.843]] };
+  const emptyGroup = { count: 0, rows: [] };
+  const renamed = { count: 1, rows: [[['left.ts', 3, 8], ['right.ts', 9, 14]]] };
+  await scan(1, renamed.rows, existing, larger, { STRUCTURAL: JSON.stringify({
+    exact: emptyGroup, renamed, gap: emptyGroup, ast: emptyGroup,
+  }) });
+  assert.match(comments[0].body, /included in the wider matches below[\s\S]*Type 2 · renamed: 1[\s\S]*right\.ts#L9-L14/);
+  await scan(1, [[['a #1.ts', 1, 8], ['b.ts', 4, 11]]], existing, larger, { SEMANTIC: JSON.stringify(semantic) });
   assert.ok(comments[0].body.includes([
     '### Duplicated code', '', '| Metric | Before | After |', '| --- | --- | --- |',
     '| Revision | `bbbbbbb` (merge base) | `abc` (PR head) |',
@@ -37,8 +44,14 @@ test('one report is created, updated on a clean push, and not overwritten by a s
     '| Clone pairs | 1 | 2 |', '| Scanned source files | 3 | 4 |', '', 'New clone pairs: **1**',
   ].join('\n')));
   assert.match(comments[0].body, /a%20%231\.ts#L1-L8/);
+  assert.match(comments[0].body, /a%20%231\.ts#L1-L8[\s\S]*Semantic candidates[\s\S]*one\.ts#L2-L12[\s\S]*two\.ts#L3-L14.*similarity: 0\.843/);
   await scan(0, []);
   assert.ok(comments[0].body.includes('| Scanned source files | 3 | 3 |\n\nNo new duplicated code.'));
+  assert.match(comments[0].body, /Semantic scan unavailable/);
+  await scan(0, [], existing, existing, { SEMANTIC: '{"count":0,"rows":[]}' });
+  assert.match(comments[0].body, /No new semantic candidates/);
+  await scan(0, [], existing, existing, { ELIGIBILITY: 'unchanged' });
+  assert.match(comments[0].body, /Skipped: no JS\/TS/);
   await scan(0, [], empty, empty);
   assert.ok(comments[0].body.includes('| Duplicated lines (%) | — | — |'));
   assert.ok(comments[0].body.includes('| Scanned source files | 0 (no files scanned) | 0 (no files scanned) |'));

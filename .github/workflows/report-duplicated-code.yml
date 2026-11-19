@@ -1,27 +1,40 @@
-# Organization setup: create a branch ruleset for all repositories and their default
-# branches. Require this workflow from photon-hq/.github at a reviewed commit SHA.
-# Repositories with no tracked JS/TS files do not receive a comment.
+# Optional report for pull_request callers. Never require this workflow or its checks for merge.
 name: Report duplicated code
-on:
-  pull_request:
-  merge_group:
+on: workflow_call
 
 permissions: {}
+concurrency:
+  group: report-duplicated-code-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  JSCPD_VERSION: '5.4.3'
+  MODEL: CodeRankEmbed
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: source
+    env:
+      BASE: ${{ github.event.pull_request.base.sha }}
     outputs:
+      structural: ${{ steps.structural.outputs.structural }}
+      structure_state: ${{ steps.scan.outputs.structural }}
       scope: ${{ steps.scope.outputs.scope }}
       report: ${{ steps.scan.outputs.report }}
+      semantic: ${{ steps.semantic.outputs.semantic }}
+      eligibility: ${{ steps.scan.outputs.eligibility }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: github.event_name == 'pull_request'
         id: checkout
         continue-on-error: true
         with:
+          path: source
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
@@ -31,73 +44,94 @@ jobs:
         id: scope
         continue-on-error: true
         run: |
-          git ls-files -z -- '*.js' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts' > "$RUNNER_TEMP/js-files"
+          git ls-files -z -- '*.js' '*.es' '*.es6' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts' > "$RUNNER_TEMP/js-files"
           if [ -s "$RUNNER_TEMP/js-files" ]; then
             echo 'scope=js' >> "$GITHUB_OUTPUT"
           else
             echo 'scope=skip' >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Scan head against the merge base
-        if: steps.scope.outputs.scope == 'js'
+      - name: Check out the report implementation at the caller's pin
+        if: steps.scope.outputs.scope == 'js' && job.workflow_sha != ''
+        id: implementation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        continue-on-error: true
+        with:
+          repository: photon-hq/.github
+          ref: ${{ job.workflow_sha }}
+          path: policy
+          sparse-checkout: .github/duplication
+          persist-credentials: false
+
+      - name: Scan exact duplicates
+        if: steps.implementation.outcome == 'success'
         id: scan
         continue-on-error: true
         timeout-minutes: 8
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          base=$(git merge-base "$BASE" HEAD)
           tool="$RUNNER_TEMP/jscpd"
           mkdir -p "$tool"
-          (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save jscpd@5.4.3)
-          python3 -I - "$tool/config.json" <<'PY'
-          import json, pathlib, sys
-          config = {
-              'format': ['typescript', 'tsx', 'javascript', 'jsx'], 'mode': 'mild',
-              'minTokens': 50, 'minLines': 5,
-              'ignore': ['**/{node_modules,dist,generated,gen,test,tests,__tests__,fixtures}/**',
-                         '**/*.test.*', '**/*.spec.*'],
-          }
-          source = pathlib.Path('.jscpd.json')
-          if source.is_symlink():
-              sys.exit('Expected a regular .jscpd.json')
-          if source.is_file():
-              options = json.loads(source.read_text())
-              # Allow detection settings, not alternate input/output paths, plugins or network providers.
-              for key in (*config, 'pattern', 'maxLines', 'maxSize', 'ignorePattern', 'skipLocal'):
-                  if key in options:
-                      config[key] = options[key]
-          pathlib.Path(sys.argv[1]).write_text(json.dumps(config))
-          PY
-          git worktree add --quiet --detach "$tool/base" "$base"
-          scan=("$tool/node_modules/.bin/jscpd" . --config "$tool/config.json" --baseline "$tool/baseline.json" --reporters json --absolute)
-          (cd "$tool/base" && "${scan[@]}" --update-baseline --output "$tool/before") > "$tool/base.log" 2>&1
-          test -f "$tool/baseline.json"
-          "${scan[@]}" --output "$tool/after" > "$tool/head.log" 2>&1
-          python3 -I - "$tool" "$base" <<'PY'
-          import json, os, pathlib, subprocess, sys
-          tool = pathlib.Path(sys.argv[1])
-          def totals(report):
-              return {k: report['statistics']['total'][k] for k in ('percentage', 'duplicatedLines', 'clones', 'sources')}
-          before = totals(json.loads((tool / 'before/jscpd-report.json').read_text()))
-          report = json.loads((tool / 'after/jscpd-report.json').read_text())
-          clones = [d for d in report['duplicates'] if d['isNew']]
-          tracked = set(os.fsdecode(subprocess.check_output(['git', 'ls-files', '-z'])).split('\0'))
-          rows = []
-          for clone in sorted(clones, key=lambda d: -d['lines'])[:20]:
-              pair = []
-              for side in ('firstFile', 'secondFile'):
-                  f = clone[side]
-                  name = os.path.relpath(f['name'])
-                  if name not in tracked:
-                      sys.exit('Unexpected file in scanner output')
-                  pair.append([name, f['start'], f['end']])
-              rows.append(pair)
-          result = json.dumps({'base': sys.argv[2], 'before': before, 'after': totals(report),
-                               'count': len(clones), 'rows': rows}, separators=(',', ':'))
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              print('report=' + result, file=output)
-          PY
+          (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save "jscpd@$JSCPD_VERSION")
+          python3 -I ../policy/.github/duplication/scan.py exact
+          echo "family=jscpd-v1-$RUNNER_OS-$RUNNER_ARCH-$JSCPD_VERSION-$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: Compare renamed and near-miss clones
+        if: steps.scan.outputs.structural == 'run'
+        id: structural
+        continue-on-error: true
+        timeout-minutes: 8
+        run: python3 -I ../policy/.github/duplication/scan.py structural
+
+      - name: Restore public model weights
+        if: steps.scan.outputs.eligibility == 'run'
+        id: weights
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/models/nomic-ai--CodeRankEmbed
+          key: ${{ steps.scan.outputs.family }}-weights
+
+      - name: Prepare the local CPU model
+        if: steps.scan.outputs.eligibility == 'run'
+        id: model
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          cd "$RUNNER_TEMP/jscpd"
+          node_modules/.bin/jscpd --semantic-download "$MODEL"
+
+      - name: Save verified weights on a cache miss
+        if: steps.model.outcome == 'success' && steps.weights.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/models/nomic-ai--CodeRankEmbed
+          key: ${{ steps.scan.outputs.family }}-weights
+
+      - name: Restore vectors from this PR
+        if: steps.model.outcome == 'success'
+        id: vectors
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/embeddings
+          key: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-
+
+      - name: Find new semantic candidates (local CPU)
+        if: steps.model.outcome == 'success'
+        id: semantic
+        continue-on-error: true
+        timeout-minutes: 12
+        run: python3 -I ../policy/.github/duplication/scan.py semantic
+
+      - name: Save updated vectors for the next push
+        if: steps.semantic.outcome == 'success' && steps.vectors.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/jscpd/embeddings
+          key: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
 
   comment:
     needs: scan
@@ -105,9 +139,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-    concurrency:
-      group: jscpd-comment-${{ github.event.pull_request.number || github.run_id }}
-      cancel-in-progress: false
     steps:
       - name: Publish the report
         if: github.event_name == 'pull_request'
@@ -116,6 +147,10 @@ jobs:
         env:
           SCOPE: ${{ needs.scan.outputs.scope }}
           REPORT: ${{ needs.scan.outputs.report }}
+          STRUCTURAL: ${{ needs.scan.outputs.structural }}
+          STRUCTURE_STATE: ${{ needs.scan.outputs.structure_state }}
+          ELIGIBILITY: ${{ needs.scan.outputs.eligibility }}
+          SEMANTIC: ${{ needs.scan.outputs.semantic }}
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -139,6 +174,16 @@ jobs:
                   : ['—', '—', '—', '0 (no files scanned)'];
               };
               const left = column(before), right = column(after);
+              const validGroup = g => Number.isSafeInteger(g?.count) && g.count >= 0 &&
+                Array.isArray(g.rows) && g.rows.length === Math.min(20, g.count);
+              let findings;
+              if (process.env.STRUCTURAL) {
+                try {
+                  const parsed = JSON.parse(process.env.STRUCTURAL);
+                  if (['exact', 'renamed', 'gap', 'ast'].every(k => validGroup(parsed[k]))) findings = parsed;
+                } catch { /* Keep the exact-only report if the structural result is unavailable. */ }
+              }
+              const exact = findings?.exact ?? { count, rows };
               text = [
                 '| Metric | Before | After |',
                 '| --- | --- | --- |',
@@ -146,7 +191,9 @@ jobs:
                 ...['Duplicated lines (%)', 'Duplicate line count', 'Clone pairs', 'Scanned source files']
                   .map((name, i) => `| ${name} | ${left[i]} | ${right[i]} |`),
                 '',
-                count ? `New clone pairs: **${count}**` : 'No new duplicated code.',
+                count === 0 ? 'No new duplicated code. (Type 1)' :
+                  exact.count ? `New clone pairs: **${exact.count}** (Type 1 · exact)` :
+                  'New exact blocks are included in the wider matches below.',
               ].join('\n');
               const link = ([file, start, end]) => {
                 if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start ||
@@ -157,14 +204,52 @@ jobs:
                   .replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16))).join('/');
                 return `[${name}:${start}-${end}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${name}#L${start}-L${end})`;
               };
-              let shown = 0;
-              for (const [a, b] of rows) {
-                const line = `\n- ${link(a)} ↔ ${link(b)}`;
-                if (text.length + line.length > 60000) break;
-                text += line;
-                shown++;
+              const list = (pairs, total, budget, semantic = false) => {
+                let lines = '', shown = 0;
+                for (const [a, b, score] of pairs) {
+                  if (semantic && (!Number.isFinite(score) || score < -1 || score > 1)) {
+                    throw new Error('Invalid similarity');
+                  }
+                  const line = `\n- ${link(a)} ↔ ${link(b)}` + (semantic ? ` (similarity: ${score.toFixed(3)})` : '');
+                  if (lines.length + line.length > budget) break;
+                  lines += line;
+                  shown++;
+                }
+                return lines + (shown < total ? `\n\nShowing ${shown} of ${total} pairs.` : '');
+              };
+              text += list(exact.rows, exact.count, 42000 - text.length);
+              text += '\n\n### Renamed and near-miss clones\n\n';
+              if (process.env.STRUCTURE_STATE === 'unchanged' || process.env.STRUCTURE_STATE === 'empty') {
+                text += 'Skipped: no changed scan inputs or no scanned files.';
+              } else {
+                if (findings) {
+                  const sections = [];
+                  for (const [kind, title] of [['renamed', 'Type 2 · renamed'], ['gap', 'Type 3 · small gaps'], ['ast', 'Type 3 · similar syntax trees']]) {
+                    const group = findings[kind];
+                    if (group.count) sections.push(`**${title}: ${group.count}**` + list(group.rows, group.count, 4500));
+                  }
+                  text += sections.join('\n\n') || 'No new renamed or near-miss clones.';
+                } else {
+                  text += 'Renamed/near-miss scan unavailable. The exact results above are unaffected.';
+                }
               }
-              if (shown < count) text += `\n\nShowing ${shown} of ${count} pairs.`;
+              text += '\n\n### Semantic candidates (experimental)\n\n';
+              if (process.env.ELIGIBILITY === 'unchanged') {
+                text += 'Skipped: no JS/TS or scan-input changes since the merge base.';
+              } else if (process.env.ELIGIBILITY === 'too-few-files') {
+                text += 'Skipped: fewer than two scanned JS/TS files.';
+              } else {
+                try {
+                  const candidates = JSON.parse(process.env.SEMANTIC);
+                  if (!validGroup(candidates)) throw new Error('Invalid candidates');
+                  text += candidates.count
+                    ? `New candidates: **${candidates.count}**. Review for similar behavior; these are not exact duplicates.` +
+                      list(candidates.rows, candidates.count, 64000 - text.length, true)
+                    : 'No new semantic candidates.';
+                } catch {
+                  text += 'Semantic scan unavailable. The exact results above are unaffected.';
+                }
+              }
             }
             const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
             if (current.state !== 'open' || current.head.sha !== head) return;
