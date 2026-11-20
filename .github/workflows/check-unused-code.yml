@@ -1,0 +1,255 @@
+name: Check unused code
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+  workflow_call:
+
+permissions: {}
+
+env:
+  KNIP_VERSION: '6.46.1'
+
+jobs:
+  scan:
+    runs-on: ${{ github.event.pull_request.head.repo.id && github.event.pull_request.head.repo.id == github.event.repository.id && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    defaults:
+      run:
+        working-directory: source
+    outputs:
+      scope: ${{ steps.scope.outputs.scope || steps.merge_group.outputs.scope }}
+      state: ${{ steps.scan.outputs.state || steps.merge_group.outputs.state }}
+      report: ${{ steps.scan.outputs.report }}
+    steps:
+      - name: Pass on merge queue (already checked on pull request)
+        if: github.event_name == 'merge_group'
+        id: merge_group
+        working-directory: .
+        run: |
+          echo 'scope=skip' >> "$GITHUB_OUTPUT"
+          echo 'state=clean' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: github.event_name == 'pull_request'
+        id: checkout
+        continue-on-error: true
+        with:
+          path: source
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect tracked JS and TS
+        if: steps.checkout.outcome == 'success'
+        id: scope
+        continue-on-error: true
+        run: |
+          git ls-files -z -- '*.js' '*.es' '*.es6' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts' > "$RUNNER_TEMP/js-files"
+          if [ -s "$RUNNER_TEMP/js-files" ]; then
+            echo 'scope=js' >> "$GITHUB_OUTPUT"
+          else
+            echo 'scope=skip' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the implementation at the workflow revision
+        if: steps.scope.outputs.scope == 'js' && job.workflow_sha != ''
+        id: implementation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        continue-on-error: true
+        with:
+          repository: photon-hq/.github
+          ref: ${{ job.workflow_sha }}
+          path: policy
+          sparse-checkout: .github/unused
+          persist-credentials: false
+
+      - name: Resolve live pull request labels
+        if: github.event_name == 'pull_request' && steps.scope.outputs.scope == 'js'
+        id: pr_labels
+        continue-on-error: true
+        working-directory: .
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$PR_NUMBER" ] && live_labels="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '[.labels[].name] | tojson' 2>/dev/null)"; then
+            echo "labels=$live_labels" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check newly introduced unused code
+        if: github.event_name == 'pull_request' && steps.scope.outputs.scope != 'skip'
+        id: scan
+        timeout-minutes: 10
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LABELS: ${{ steps.pr_labels.outputs.labels || toJSON(github.event.pull_request.labels.*.name) }}
+          SCOPE_STATE: ${{ steps.scope.outputs.scope }}
+          IMPL_OUTCOME: ${{ steps.implementation.outcome }}
+        run: |
+          if [ "$SCOPE_STATE" != 'js' ] || [ "$IMPL_OUTCOME" != 'success' ]; then
+            echo 'state=unavailable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tool="$RUNNER_TEMP/knip"
+          mkdir -p "$tool"
+          if ! (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save "knip@$KNIP_VERSION"); then
+            echo 'state=unavailable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node ../policy/.github/unused/scan.mjs
+
+  comment:
+    needs: scan
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: check-unused-code-comment-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      queue: max
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Publish the report
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          SCOPE: ${{ needs.scan.outputs.scope }}
+          STATE: ${{ needs.scan.outputs.state }}
+          REPORT: ${{ needs.scan.outputs.report }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+            const target = { ...context.repo, issue_number: pr.number };
+            const marker = '<!-- photon-knip -->';
+            const head = pr.head?.sha;
+            const baseRef = pr.base?.ref;
+            const baseSha = pr.base?.sha;
+            const getLiveState = async () => {
+              const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
+              const hasLiveLabels = Array.isArray(current.labels);
+              const liveWaived = hasLiveLabels && current.labels.some(l => l?.name === 'allow-unused');
+              const ok =
+                current.state === 'open' &&
+                Boolean(head) &&
+                current.head?.sha === head &&
+                Boolean(baseRef) &&
+                current.base?.ref === baseRef &&
+                Boolean(baseSha) &&
+                current.base?.sha === baseSha;
+              return { ok, hasLiveLabels, liveWaived };
+            };
+            const initialLive = await getLiveState();
+            if (!initialLive.ok) return;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
+            const matching = comments.filter(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            const [old, ...duplicates] = matching;
+            const deleteIfPresent = async () => {
+              if (!matching.length) return;
+              const live = await getLiveState();
+              if (!live.ok) return;
+              for (const c of matching) {
+                await github.rest.issues.deleteComment({ ...context.repo, comment_id: c.id });
+              }
+            };
+            if (process.env.SCOPE === 'skip' || process.env.STATE === 'unavailable' || !process.env.REPORT) {
+              await deleteIfPresent();
+              return;
+            }
+            const parsed = JSON.parse(process.env.REPORT);
+            const { base, before, after, addedCount, resolvedCount, waived, added } = parsed;
+            const validTotals = t => t && [t.files, t.exports, t.duplicates, t.dependencies]
+              .every(n => Number.isSafeInteger(n) && n >= 0);
+            const validPath = f => typeof f === 'string' && f.length > 0 &&
+              !f.startsWith('/') && f.split('/').every(part => part && part !== '.' && part !== '..');
+            const validCategories = new Set([
+              'files', 'exports', 'types', 'nsExports', 'nsTypes', 'enumMembers', 'duplicates', 'dependencies'
+            ]);
+            if (!/^[0-9a-f]{40}$/.test(base) || !validTotals(before) || !validTotals(after) ||
+                !Number.isSafeInteger(addedCount) || addedCount < 0 ||
+                !Number.isSafeInteger(resolvedCount) || resolvedCount < 0 ||
+                typeof waived !== 'boolean' || !Array.isArray(added) ||
+                added.length !== Math.min(addedCount, 50) ||
+                !added.every(r => r && validCategories.has(r.category) && validPath(r.file) &&
+                  typeof r.symbol === 'string' && Number.isSafeInteger(r.line) && r.line > 0)) {
+              throw new Error('Invalid unused-code report');
+            }
+            if (addedCount === 0 && resolvedCount === 0) {
+              await deleteIfPresent();
+              return;
+            }
+
+            const rows = [
+              ['Unused files', before.files, after.files],
+              ['Unused exports & types', before.exports, after.exports],
+              ['Duplicate exports', before.duplicates, after.duplicates],
+              ['New unused dependencies', before.dependencies, after.dependencies],
+            ];
+            let text = [
+              `| Category | Before \`${base.slice(0, 7)}\` | After \`${head.slice(0, 7)}\` |`,
+              '| --- | ---: | ---: |',
+              ...rows.map(([label, b, a]) => `| ${label} | ${b} | ${a} |`),
+            ].join('\n');
+
+            const resolvedNote = resolvedCount ? ` · resolved ${resolvedCount} pre-existing` : '';
+            if (addedCount > 0) {
+              const noun = addedCount === 1 ? 'item' : 'items';
+              const status = waived
+                ? `**${addedCount} new unused ${noun}** (waived via \`allow-unused\` label)${resolvedNote}.`
+                : `**${addedCount} new unused ${noun}**${resolvedNote}. Remove unused code, mark intentional stacked-PR or public exports with \`/** @public */\` (include a description line above \`@public\` in non-library packages), or add the \`allow-unused\` PR label.`;
+              text += '\n\n' + status;
+            } else {
+              const noun = resolvedCount === 1 ? 'item' : 'items';
+              text += `\n\nResolved ${resolvedCount} pre-existing unused ${noun} · 0 new.`;
+            }
+
+            if (added.length > 0) {
+              const escape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, c => encodeURIComponent(c));
+              const link = (file, line) => {
+                const parts = file.split('/');
+                const encoded = parts.map(part => encodeURIComponent(part)
+                  .replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16))).join('/');
+                const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${encoded}#L${line}`;
+                return `<a href="${url}"><code>${escape(file)}:${line}</code></a>`;
+              };
+              const labels = {
+                files: 'Unused file',
+                exports: 'Unused export',
+                nsExports: 'Unused namespace export',
+                types: 'Unused type',
+                nsTypes: 'Unused namespace type',
+                enumMembers: 'Unused enum member',
+                duplicates: 'Duplicate export',
+                dependencies: 'Unused dependency',
+              };
+              const lines = [];
+              let budget = 62000 - text.length;
+              for (const { category, file, symbol, line } of added) {
+                const sym = symbol ? ` <code>${escape(symbol)}</code>` : '';
+                const entry = `- **${labels[category]}**${sym}: ${link(file, line)}`;
+                if (entry.length > budget) break;
+                lines.push(entry);
+                budget -= entry.length + 1;
+              }
+              if (lines.length) text += '\n\n' + lines.slice(0, 10).join('\n');
+              if (addedCount > 10 && lines.length > 10) {
+                text += `\n\n<details><summary>${lines.length - 10} more shown</summary>\n\n${lines.slice(10).join('\n')}\n\n</details>`;
+              }
+              if (lines.length < addedCount) {
+                text += `\n\nShowing ${lines.length} of ${addedCount} findings.`;
+              }
+            }
+
+            const body = `${marker}\n### Unused code\n\n${text}`;
+            const finalLive = await getLiveState();
+            if (!finalLive.ok || (addedCount > 0 && finalLive.hasLiveLabels && waived !== finalLive.liveWaived)) return;
+            for (const dup of duplicates) {
+              await github.rest.issues.deleteComment({ ...context.repo, comment_id: dup.id });
+            }
+            if (old) await github.rest.issues.updateComment({ ...context.repo, comment_id: old.id, body });
+            else await github.rest.issues.createComment({ ...target, body });
