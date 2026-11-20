@@ -883,6 +883,10 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
       'real-after-div-pkg',
       'real-after-private-for-pkg',
     ]);
+    const hashbangUnicodeRefs = collectReferencedPackagesInSource(
+      '\ufeff#!/usr/bin/env node\u2028import "hashbang-ls-pkg";\u2029import "hashbang-ps-pkg";',
+    );
+    assert.deepEqual([...hashbangUnicodeRefs].sort(), ['hashbang-ls-pkg', 'hashbang-ps-pkg']);
 
     // 2. Full repo scan with UTF-8 BOM root `package.json#knip`, `pnpm-workspace.yaml#include`,
     //    in-repo `..shared` tsconfig path target, and Node `#imports` exact/specificity/wildcard substitution.
@@ -918,6 +922,7 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
       'packages/app/package.json': JSON.stringify({
         name: '@demo/app',
         private: true,
+        type: 'module',
         imports: {
           '#log/main': './src/local-log.ts',
           '#log/*': 'unused-wildcard-log/*',
@@ -936,12 +941,40 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
             node: 'used-node-cond-pkg/*',
             default: './src/local-log.ts',
           },
+          '#fallback-url': ['node:fs', 'used-after-url-fallback-pkg'],
+          '#fallback-null': [null, 'used-after-null-fallback-pkg'],
+          '#cond-null': {
+            default: null,
+            node: 'unused-after-null-cond-pkg',
+          },
+          '#cond-cts': {
+            require: 'used-cts-require-pkg',
+            default: './src/local-log.ts',
+          },
+          '#cond-cts-typeonly': {
+            require: 'unused-cts-typeonly-require-pkg',
+            default: './src/local-log.ts',
+          },
+          '#cond-cts-dyn': {
+            require: 'unused-cts-dyn-require-pkg',
+            default: './src/local-log.ts',
+          },
+          '#local-cond': {
+            default: './dist/local-log.js',
+            node: './dist/unreachable-cond-file.js',
+          },
         },
       }),
       'packages/app/tsconfig.json': JSON.stringify({
         extends: '../../tsconfig.json',
       }),
-      'packages/app/src/local-log.ts': 'export const logMain = () => "local";',
+      'packages/app/src/local-log.ts': 'export type LogKind = string;\nexport const logMain = () => "local";',
+      'packages/app/bin/cli.cts': [
+        'import ctsVal from "#cond-cts";',
+        'export type { LogKind } from "#cond-cts-typeonly";',
+        'const loadDyn = () => import("#cond-cts-dyn");',
+        'console.log(ctsVal, loadDyn);',
+      ].join('\n'),
       'packages/app/src/index.ts': [
         'import { dotdotHelper } from "@dotdot/util";',
         'import { logMain } from "#log/main";',
@@ -950,7 +983,11 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
         'import deadCond from "#cond-dead/main";',
         'import reqCond from "#cond-require-only";',
         'import liveCond from "#cond-live/main";',
-        'console.log(dotdotHelper(), logMain(), client, sdk, deadCond, reqCond, liveCond);',
+        'import urlFb from "#fallback-url";',
+        'import nullFb from "#fallback-null";',
+        'import nullCond from "#cond-null";',
+        'import localCond from "#local-cond";',
+        'console.log(dotdotHelper(), logMain(), client, sdk, deadCond, reqCond, liveCond, urlFb, nullFb, nullCond, localCond);',
       ].join('\n'),
     });
     // Write `package.json` directly so the leading UTF-8 BOM is exact, and mark `pnpm-workspace.yaml` executable (`0o755`)
@@ -966,23 +1003,27 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
     execFileSync('git', ['config', 'core.filemode', 'true'], { cwd: root });
     const baseSha = commitAll(root, 'base');
 
-    // Add dependencies on HEAD:
-    // - `used-specific-svc`, `@demo-ext/used-sdk`, and `used-node-cond-pkg` are referenced via reachable `#imports` targets.
-    // - `unused-wildcard-log` (shadowed by exact `#log/main`), `unused-broad-svc` (shadowed by `#svc/http/*`),
-    //   `unused-after-default-pkg` (unreachable after `default`), `unused-require-only-pkg` (unreachable from ESM `import`),
-    //   and `@demo-ext/unused-sdk` must all be reported as unused!
+    // Add dependencies and an unreachable `#local-cond` file on HEAD:
     writeFiles(root, {
+      'packages/app/src/unreachable-cond-file.ts': 'export const deadCondBranch = 1;',
       'packages/app/package.json': JSON.stringify({
         name: '@demo/app',
         private: true,
+        type: 'module',
         dependencies: {
           'used-specific-svc': '^1.0.0',
           '@demo-ext/used-sdk': '^1.0.0',
           'used-node-cond-pkg': '^1.0.0',
+          'used-after-url-fallback-pkg': '^1.0.0',
+          'used-after-null-fallback-pkg': '^1.0.0',
+          'used-cts-require-pkg': '^1.0.0',
           'unused-wildcard-log': '^1.0.0',
           'unused-broad-svc': '^1.0.0',
           'unused-after-default-pkg': '^1.0.0',
+          'unused-after-null-cond-pkg': '^1.0.0',
           'unused-require-only-pkg': '^1.0.0',
+          'unused-cts-typeonly-require-pkg': '^1.0.0',
+          'unused-cts-dyn-require-pkg': '^1.0.0',
           '@demo-ext/unused-sdk': '^1.0.0',
         },
         imports: {
@@ -1003,10 +1044,39 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
             node: 'used-node-cond-pkg/*',
             default: './src/local-log.ts',
           },
+          '#fallback-url': ['node:fs', 'used-after-url-fallback-pkg'],
+          '#fallback-null': [null, 'used-after-null-fallback-pkg'],
+          '#cond-null': {
+            default: null,
+            node: 'unused-after-null-cond-pkg',
+          },
+          '#cond-cts': {
+            require: 'used-cts-require-pkg',
+            default: './src/local-log.ts',
+          },
+          '#cond-cts-typeonly': {
+            require: 'unused-cts-typeonly-require-pkg',
+            default: './src/local-log.ts',
+          },
+          '#cond-cts-dyn': {
+            require: 'unused-cts-dyn-require-pkg',
+            default: './src/local-log.ts',
+          },
+          '#local-cond': {
+            default: './dist/local-log.js',
+            node: './dist/unreachable-cond-file.js',
+          },
         },
       }),
     });
     commitAll(root, 'head');
+
+    const headCfg = buildKnipConfig(root);
+    assert.equal(headCfg.workspaces['packages/app'].entry.includes('src/local-log.ts'), true);
+    assert.equal(
+      headCfg.workspaces['packages/app'].entry.includes('src/unreachable-cond-file.ts'),
+      false,
+    );
 
     const res = executePrCheck({
       sourceDir: root,
@@ -1029,11 +1099,15 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
     assert.equal(res.exitCode, 1);
     assert.equal(res.state, 'failed');
     assert.deepEqual(
-      res.report.added.map((a) => `${a.category}:${a.symbol}`),
+      res.report.added.map((a) => `${a.category}:${a.symbol || a.file}`),
       [
+        'files:packages/app/src/unreachable-cond-file.ts',
         'dependencies:@demo-ext/unused-sdk',
         'dependencies:unused-after-default-pkg',
+        'dependencies:unused-after-null-cond-pkg',
         'dependencies:unused-broad-svc',
+        'dependencies:unused-cts-dyn-require-pkg',
+        'dependencies:unused-cts-typeonly-require-pkg',
         'dependencies:unused-require-only-pkg',
         'dependencies:unused-wildcard-log',
       ],

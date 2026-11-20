@@ -18,6 +18,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildKnipConfig,
+  collectReachableImportTargets,
+  extractPackageNameFromSpecifier,
   isRealPathInsideRepo,
   parseJsonc,
   SKIP_DIRS,
@@ -158,30 +160,67 @@ export function parseKnipJsonReport(reportObj, trackedFiles = null) {
   return findings;
 }
 
-export function extractPackageNameFromSpecifier(rawSpec) {
-  if (typeof rawSpec !== 'string') return null;
-  let spec = rawSpec.trim();
+function isTypeOnlyFromClause(tokens, fromIdx) {
+  let kwIdx = -1;
+  for (let k = fromIdx - 1; k >= 0; k--) {
+    const t = tokens[k];
+    if (t.type === 'punct' && t.value === ';') break;
+    if (t.type === 'ident' && t.value === 'from' && tokens[k - 1]?.value !== '.') break;
+    if (
+      t.type === 'ident' &&
+      (t.value === 'import' || t.value === 'export') &&
+      tokens[k - 1]?.value !== '.'
+    ) {
+      kwIdx = k;
+      break;
+    }
+  }
+  if (kwIdx < 0) return false;
+
   if (
-    !spec ||
-    spec.startsWith('.') ||
-    spec.startsWith('/') ||
-    spec.startsWith('#') ||
-    spec.includes(':')
+    tokens[kwIdx + 1]?.type === 'ident' &&
+    tokens[kwIdx + 1]?.value === 'type' &&
+    kwIdx + 1 < fromIdx - 1 &&
+    tokens[kwIdx + 2]?.value !== ','
   ) {
-    return null;
+    return true;
   }
-  const qIdx = spec.indexOf('?');
-  if (qIdx >= 0) spec = spec.slice(0, qIdx);
-  if (spec.startsWith('@')) {
-    const parts = spec.split('/');
-    return parts.length >= 2 && parts[0] && parts[1] ? `${parts[0]}/${parts[1]}` : null;
+
+  if (
+    tokens[kwIdx + 1]?.type === 'punct' &&
+    tokens[kwIdx + 1]?.value === '{' &&
+    tokens[fromIdx - 1]?.type === 'punct' &&
+    tokens[fromIdx - 1]?.value === '}'
+  ) {
+    const groups = [];
+    let current = [];
+    for (let k = kwIdx + 2; k < fromIdx - 1; k++) {
+      if (tokens[k].type === 'punct' && tokens[k].value === ',') {
+        if (current.length > 0) groups.push(current);
+        current = [];
+      } else {
+        current.push(tokens[k]);
+      }
+    }
+    if (current.length > 0) groups.push(current);
+    if (
+      groups.length > 0 &&
+      groups.every(
+        (g) =>
+          g.length >= 2 &&
+          g[0].type === 'ident' &&
+          g[0].value === 'type' &&
+          !(g.length === 3 && g[1].type === 'ident' && g[1].value === 'as'),
+      )
+    ) {
+      return true;
+    }
   }
-  const slashIdx = spec.indexOf('/');
-  const name = slashIdx >= 0 ? spec.slice(0, slashIdx) : spec;
-  return name || null;
+
+  return false;
 }
 
-function collectReferencedSpecifiersInSource(rawSource) {
+function collectReferencedSpecifiersInSource(rawSource, staticImportMode = 'any') {
   const tokens = tokenizeModuleSource(rawSource);
   const packages = new Set();
   const subpathImports = new Map();
@@ -262,13 +301,16 @@ function collectReferencedSpecifiersInSource(rawSource) {
     const prev = tokens[i - 1];
 
     if (tok.type === 'ident' && tok.value === 'from' && prev?.value !== '.') {
-      if (tokens[i + 1]?.type === 'string') addSpec(tokens[i + 1].value, 'import');
+      if (tokens[i + 1]?.type === 'string') {
+        const clauseMode = isTypeOnlyFromClause(tokens, i) ? 'import' : staticImportMode;
+        addSpec(tokens[i + 1].value, clauseMode);
+      }
       continue;
     }
 
     if (tok.type === 'ident' && tok.value === 'import' && prev?.value !== '.') {
       if (tokens[i + 1]?.type === 'string') {
-        addSpec(tokens[i + 1].value, 'import');
+        addSpec(tokens[i + 1].value, staticImportMode);
       } else if (
         tokens[i + 1]?.type === 'punct' &&
         tokens[i + 1].value === '(' &&
@@ -331,92 +373,11 @@ export function collectReferencedPackagesInSource(rawSource) {
   return collectReferencedSpecifiersInSource(rawSource).packages;
 }
 
-function isValidSubpathTargetString(target) {
-  if (typeof target !== 'string' || !target) return false;
-  if (target.startsWith('./')) {
-    const segments = target.slice(2).split('/');
-    return (
-      segments.length > 0 &&
-      !segments.some(
-        (seg) => seg === '.' || seg === '..' || seg.toLowerCase() === 'node_modules',
-      )
-    );
-  }
-  if (target.startsWith('.') || target.startsWith('/') || target.startsWith('#')) {
-    return false;
-  }
-  return extractPackageNameFromSpecifier(target) !== null || URL.canParse(target);
-}
-
-function collectReachableImportTargets(
-  targetValue,
-  patternMatch,
-  mode,
-  activeConditions = new Set(),
-  excludedConditions = new Set(),
-) {
-  if (targetValue === null) {
-    return { targets: [], exhausted: true };
-  }
-  if (typeof targetValue === 'string') {
-    const resolved =
-      patternMatch !== null ? targetValue.replaceAll('*', patternMatch) : targetValue;
-    if (!isValidSubpathTargetString(resolved)) {
-      return { targets: [], exhausted: false };
-    }
-    return { targets: [resolved], exhausted: true };
-  }
-  if (Array.isArray(targetValue)) {
-    const targets = [];
-    for (const item of targetValue) {
-      const sub = collectReachableImportTargets(
-        item,
-        patternMatch,
-        mode,
-        activeConditions,
-        excludedConditions,
-      );
-      for (const t of sub.targets) targets.push(t);
-      if (sub.exhausted) return { targets, exhausted: true };
-    }
-    return { targets, exhausted: false };
-  }
-  if (targetValue && typeof targetValue === 'object') {
-    const targets = [];
-    const localExcluded = new Set(excludedConditions);
-    for (const [condKey, subVal] of Object.entries(targetValue)) {
-      if (localExcluded.has(condKey)) continue;
-      if (
-        (condKey === 'import' && mode === 'require') ||
-        (condKey === 'require' && mode === 'import')
-      ) {
-        continue;
-      }
-      const isGuaranteedTrue =
-        condKey === 'default' ||
-        (condKey === 'import' && mode === 'import') ||
-        (condKey === 'require' && mode === 'require') ||
-        activeConditions.has(condKey);
-      const nextActive = new Set(activeConditions);
-      nextActive.add(condKey);
-      const sub = collectReachableImportTargets(
-        subVal,
-        patternMatch,
-        mode,
-        nextActive,
-        localExcluded,
-      );
-      for (const t of sub.targets) targets.push(t);
-      if (isGuaranteedTrue && sub.exhausted) {
-        return { targets, exhausted: true };
-      }
-      if (!isGuaranteedTrue && sub.exhausted) {
-        localExcluded.add(condKey);
-      }
-    }
-    return { targets, exhausted: false };
-  }
-  return { targets: [], exhausted: false };
+function inferStaticImportMode(relPath, pkgType) {
+  const lower = relPath.toLowerCase();
+  if (lower.endsWith('.mts') || lower.endsWith('.mjs')) return 'import';
+  if (lower.endsWith('.cts') || lower.endsWith('.cjs')) return 'require';
+  return pkgType === 'module' ? 'import' : 'any';
 }
 
 function resolveSubpathImportTargets(owningImports, hashSpec, mode = 'import') {
@@ -529,6 +490,7 @@ export function findNewUnusedDependencies({
 
   const candidateAdditions = [];
   const importsByDir = new Map();
+  const pkgTypeByDir = new Map();
   for (const relPath of [...headTrackedFiles].sort()) {
     if (path.posix.basename(relPath) !== 'package.json') continue;
     if (isSkippedManifestRelPath(relPath)) continue;
@@ -543,8 +505,10 @@ export function findNewUnusedDependencies({
       continue;
     }
     if (!pkg || typeof pkg !== 'object') continue;
+    const manifestDir = path.posix.dirname(relPath);
+    pkgTypeByDir.set(manifestDir, pkg.type === 'module' ? 'module' : 'commonjs');
     if (pkg.imports && typeof pkg.imports === 'object' && !Array.isArray(pkg.imports)) {
-      importsByDir.set(path.posix.dirname(relPath), pkg.imports);
+      importsByDir.set(manifestDir, pkg.imports);
     }
     if (typeof pkg.dependencies !== 'object' || !pkg.dependencies || Array.isArray(pkg.dependencies)) {
       continue;
@@ -563,10 +527,10 @@ export function findNewUnusedDependencies({
 
   if (candidateAdditions.length === 0) return [];
 
-  const findOwningImports = (fileRelPath) => {
+  const findNearestDirValue = (map, fileRelPath) => {
     let cur = path.posix.dirname(fileRelPath);
     while (true) {
-      if (importsByDir.has(cur)) return importsByDir.get(cur);
+      if (map.has(cur)) return map.get(cur);
       if (cur === '.' || !cur) return null;
       const next = path.posix.dirname(cur);
       if (next === cur) return null;
@@ -587,12 +551,16 @@ export function findNewUnusedDependencies({
     } catch {
       continue;
     }
-    const { packages, subpathImports } = collectReferencedSpecifiersInSource(content);
+    const pkgType = findNearestDirValue(pkgTypeByDir, relPath) ?? 'commonjs';
+    const { packages, subpathImports } = collectReferencedSpecifiersInSource(
+      content,
+      inferStaticImportMode(relPath, pkgType),
+    );
     for (const pkgName of packages) {
       referencedAnywhere.add(pkgName);
     }
     if (subpathImports.size > 0) {
-      const owningImports = findOwningImports(relPath);
+      const owningImports = findNearestDirValue(importsByDir, relPath);
       if (owningImports) {
         for (const [hashSpec, modes] of subpathImports) {
           for (const mode of modes) {

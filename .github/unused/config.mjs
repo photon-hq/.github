@@ -725,6 +725,120 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
   return collected;
 }
 
+export function extractPackageNameFromSpecifier(rawSpec) {
+  if (typeof rawSpec !== 'string') return null;
+  let spec = rawSpec.trim();
+  if (
+    !spec ||
+    spec.startsWith('.') ||
+    spec.startsWith('/') ||
+    spec.startsWith('#') ||
+    spec.includes(':')
+  ) {
+    return null;
+  }
+  const qIdx = spec.indexOf('?');
+  if (qIdx >= 0) spec = spec.slice(0, qIdx);
+  if (spec.startsWith('@')) {
+    const parts = spec.split('/');
+    return parts.length >= 2 && parts[0] && parts[1] ? `${parts[0]}/${parts[1]}` : null;
+  }
+  const slashIdx = spec.indexOf('/');
+  const name = slashIdx >= 0 ? spec.slice(0, slashIdx) : spec;
+  return name || null;
+}
+
+function isValidSubpathTargetString(target) {
+  if (typeof target !== 'string' || !target) return false;
+  if (target.startsWith('./')) {
+    const segments = target.slice(2).split('/');
+    return (
+      segments.length > 0 &&
+      !segments.some(
+        (seg) => seg === '.' || seg === '..' || seg.toLowerCase() === 'node_modules',
+      )
+    );
+  }
+  if (target.startsWith('.') || target.startsWith('/') || target.startsWith('#')) {
+    return false;
+  }
+  return extractPackageNameFromSpecifier(target) !== null;
+}
+
+export function collectReachableImportTargets(
+  targetValue,
+  patternMatch,
+  mode,
+  activeConditions = new Set(),
+  excludedConditions = new Set(),
+) {
+  if (targetValue === null) {
+    return { targets: [], state: 'null' };
+  }
+  if (typeof targetValue === 'string') {
+    const resolved =
+      patternMatch !== null ? targetValue.replaceAll('*', patternMatch) : targetValue;
+    if (!isValidSubpathTargetString(resolved)) {
+      return { targets: [], state: 'unmatched' };
+    }
+    return { targets: [resolved], state: 'resolved' };
+  }
+  if (Array.isArray(targetValue)) {
+    const targets = [];
+    let sawNull = false;
+    for (const item of targetValue) {
+      const sub = collectReachableImportTargets(
+        item,
+        patternMatch,
+        mode,
+        activeConditions,
+        excludedConditions,
+      );
+      for (const t of sub.targets) targets.push(t);
+      if (sub.state === 'resolved') return { targets, state: 'resolved' };
+      if (sub.state === 'null') sawNull = true;
+    }
+    return { targets, state: sawNull ? 'null' : 'unmatched' };
+  }
+  if (targetValue && typeof targetValue === 'object') {
+    const targets = [];
+    const localExcluded = new Set(excludedConditions);
+    for (const [condKey, subVal] of Object.entries(targetValue)) {
+      if (localExcluded.has(condKey)) continue;
+      if (
+        (condKey === 'import' && mode === 'require') ||
+        (condKey === 'require' && mode === 'import')
+      ) {
+        continue;
+      }
+      const isGuaranteedTrue =
+        condKey === 'default' ||
+        (condKey === 'import' && mode === 'import') ||
+        (condKey === 'require' && mode === 'require') ||
+        activeConditions.has(condKey);
+      const nextActive = new Set(activeConditions);
+      nextActive.add(condKey);
+      const sub = collectReachableImportTargets(
+        subVal,
+        patternMatch,
+        mode,
+        nextActive,
+        localExcluded,
+      );
+      for (const t of sub.targets) targets.push(t);
+      const isTerminal = sub.state === 'resolved' || sub.state === 'null';
+      if (isGuaranteedTrue && isTerminal) {
+        return { targets, state: sub.state };
+      }
+      if (!isGuaranteedTrue && isTerminal) {
+        localExcluded.add(condKey);
+      }
+    }
+    return { targets, state: 'unmatched' };
+  }
+  return { targets: [], state: 'unmatched' };
+}
+
 function resolveSubpathImports(wsDir, pkg) {
   const pathsMap = Object.create(null);
   const extraEntries = [];
@@ -733,7 +847,12 @@ function resolveSubpathImports(wsDir, pkg) {
   }
   for (const [impKey, impVal] of Object.entries(pkg.imports)) {
     if (!impKey.startsWith('#')) continue;
-    const rawTargets = collectStringTargets(impVal);
+    const rawTargets = [
+      ...new Set([
+        ...collectReachableImportTargets(impVal, null, 'import').targets,
+        ...collectReachableImportTargets(impVal, null, 'require').targets,
+      ]),
+    ];
     const mappedPaths = mapRawTargetsToAbsPosix(wsDir, rawTargets);
     for (const raw of rawTargets) {
       for (const entryRel of mapBuiltTargetToSource(wsDir, raw, { forPaths: false })) {
@@ -763,12 +882,14 @@ const REGEX_PREFIX_KEYWORDS = new Set([
 ]);
 
 const CONTROL_HEADER_KEYWORDS = new Set(['if', 'while', 'for', 'with']);
+const isJsLineTerminator = (c) => c === '\n' || c === '\r' || c === '\u2028' || c === '\u2029';
 
 export function tokenizeModuleSource(source) {
   const tokens = [];
   const templateBraceStack = [];
   const parenControlStack = [];
-  let i = 0;
+  const startIdx = source.charCodeAt(0) === 0xfeff ? 1 : 0;
+  let i = startIdx;
 
   const canStartRegex = () => {
     const prev = tokens[tokens.length - 1];
@@ -816,9 +937,9 @@ export function tokenizeModuleSource(source) {
     const ch = source[i];
     const next = source[i + 1];
 
-    if (i === 0 && ch === '#' && next === '!') {
+    if (i === startIdx && ch === '#' && next === '!') {
       i += 2;
-      while (i < source.length && source[i] !== '\n' && source[i] !== '\r') i++;
+      while (i < source.length && !isJsLineTerminator(source[i])) i++;
       continue;
     }
     if (/\s/.test(ch)) {
@@ -827,7 +948,7 @@ export function tokenizeModuleSource(source) {
     }
     if (ch === '/' && next === '/') {
       i += 2;
-      while (i < source.length && source[i] !== '\n' && source[i] !== '\r') i++;
+      while (i < source.length && !isJsLineTerminator(source[i])) i++;
       continue;
     }
     if (ch === '/' && next === '*') {
@@ -847,7 +968,7 @@ export function tokenizeModuleSource(source) {
         }
         if (rc === '[') inClass = true;
         else if (rc === ']' && inClass) inClass = false;
-        else if ((rc === '/' && !inClass) || rc === '\n' || rc === '\r') {
+        else if ((rc === '/' && !inClass) || isJsLineTerminator(rc)) {
           if (rc === '/') {
             i++;
             while (i < source.length && /[A-Za-z]/.test(source[i])) i++;
