@@ -4,13 +4,16 @@
 
 ## Enrollment
 
-The workflow supports both organization branch rulesets (`on: pull_request`) and explicit per-repository callers (`on: workflow_call`).
+The workflow supports organization branch rulesets (`on: pull_request`), merge queues (`on: merge_group`), and explicit per-repository callers (`on: workflow_call`). On `merge_group` events, `scan` passes immediately because the pull request was already checked before entering the merge queue and merge-group payloads do not carry pull request labels.
 
-For an explicit caller workflow, replace `REVIEWED_SHA` with the full commit SHA in `photon-hq/.github`:
+For an explicit caller workflow, replace `REVIEWED_SHA` with the full commit SHA in `photon-hq/.github` (include `merge_group:` as well if the target branch uses a GitHub merge queue):
 
 ```yaml
 name: Unused code
-on: pull_request
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
 permissions: {}
 jobs:
   unused:
@@ -20,7 +23,7 @@ jobs:
     uses: photon-hq/.github/.github/workflows/check-unused-code.yml@REVIEWED_SHA
 ```
 
-Before enrolling a repository, confirm it can use the `blacksmith-4vcpu-ubuntu-2404` runner for same-repository pull requests (fork pull requests and the comment publisher run on `ubuntu-latest`). Concurrency is serialized only on the lightweight `comment` job so overlapping dispatches never cancel `scan`.
+Before enrolling a repository, confirm it can use the `blacksmith-4vcpu-ubuntu-2404` runner for same-repository pull requests (fork pull requests and the comment publisher run on `ubuntu-latest`). Concurrency is keyed per pull request and head SHA on the `comment` job so overlapping dispatches on the same commit serialize cleanly without letting slower scans from older commits cancel or replace the current head's publisher.
 
 ## Behavior
 
@@ -39,7 +42,7 @@ Before enrolling a repository, confirm it can use the `blacksmith-4vcpu-ubuntu-2
    - Fails open (`state=unavailable`, `exit 0`) if the base commit cannot be resolved or the scanner exits unexpectedly (`exit >= 2`).
 4. **Waivers:**
    - Tag intentional public or stacked-PR exports with `/** @public */` (in non-library packages where lint rules require JSDoc descriptions, include a summary line above `@public`).
-   - Apply the `allow-unused` label on the pull request to waive the check for the entire PR (`state=waived`, `exit 0`).
-5. **Comment policy:**
+   - Apply the `allow-unused` label on the pull request to waive the check for the entire PR (`state=waived`, `exit 0`). Explicit caller workflows that include `labeled` and `unlabeled` in `on.pull_request.types` rerun automatically when the label changes. Organization branch rulesets ignore `types:` filters and run only on `opened`, `synchronize`, and `reopened`; after applying `allow-unused` on a ruleset-enrolled repository, click **Re-run jobs** on the failed check (the `scan` step re-fetches live pull request labels from the GitHub API) or push a new commit.
+5. **Comment and job-summary policy:**
    - Clean pull requests (`0` new and `0` resolved items) post no comment.
-   - When items are newly introduced or resolved, one sticky `<!-- photon-knip -->` comment is created or updated with a Before/After summary table and up to 10 direct source links (plus `<details>` overflow). If a later push resolves all findings, the prior bot comment is deleted automatically.
+   - When items are newly introduced or resolved, the `scan` step writes the summary table and findings to `GITHUB_STEP_SUMMARY` (making failed findings visible on fork pull requests where `GITHUB_TOKEN` is read-only), and the `comment` job creates or updates one sticky `<!-- photon-knip -->` comment with a Before/After summary table and up to 10 direct source links (plus `<details>` overflow). If a later push resolves all findings, the prior bot comment is deleted automatically.

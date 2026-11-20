@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -219,11 +219,12 @@ const DEFAULT_IGNORE_PATTERNS = [
 ];
 
 export function stripJsonc(text) {
-  let out = '';
+  const out = [];
   let inString = false;
   let escaped = false;
   let inLineComment = false;
   let inBlockComment = false;
+  let pendingCommaIdx = -1;
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -232,7 +233,7 @@ export function stripJsonc(text) {
     if (inLineComment) {
       if (ch === '\n' || ch === '\r') {
         inLineComment = false;
-        out += ch;
+        out.push(ch);
       }
       continue;
     }
@@ -241,12 +242,12 @@ export function stripJsonc(text) {
         inBlockComment = false;
         i++;
       } else if (ch === '\n' || ch === '\r') {
-        out += ch;
+        out.push(ch);
       }
       continue;
     }
     if (inString) {
-      out += ch;
+      out.push(ch);
       if (escaped) {
         escaped = false;
       } else if (ch === '\\') {
@@ -254,11 +255,6 @@ export function stripJsonc(text) {
       } else if (ch === '"') {
         inString = false;
       }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      out += ch;
       continue;
     }
     if (ch === '/' && next === '/') {
@@ -271,35 +267,32 @@ export function stripJsonc(text) {
       i++;
       continue;
     }
-    out += ch;
-  }
-
-  // Strip trailing commas outside string literals.
-  let cleaned = '';
-  inString = false;
-  escaped = false;
-  for (let i = 0; i < out.length; i++) {
-    const ch = out[i];
-    if (inString) {
-      cleaned += ch;
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
     if (ch === '"') {
+      pendingCommaIdx = -1;
       inString = true;
-      cleaned += ch;
+      out.push(ch);
       continue;
     }
     if (ch === ',') {
-      let j = i + 1;
-      while (j < out.length && /\s/.test(out[j])) j++;
-      if (out[j] === '}' || out[j] === ']') continue;
+      pendingCommaIdx = out.length;
+      out.push(ch);
+      continue;
     }
-    cleaned += ch;
+    if (ch === '}' || ch === ']') {
+      if (pendingCommaIdx >= 0) {
+        out[pendingCommaIdx] = '';
+        pendingCommaIdx = -1;
+      }
+      out.push(ch);
+      continue;
+    }
+    if (!/\s/.test(ch)) {
+      pendingCommaIdx = -1;
+    }
+    out.push(ch);
   }
-  return cleaned;
+
+  return out.join('');
 }
 
 export function parseJsonc(text) {
@@ -529,21 +522,49 @@ export function resolvePackageEntrySources(wsDir, pkg) {
 
 function addUniquePathTargets(map, key, targets) {
   if (!key || targets.length === 0) return;
-  const existing = map[key] ?? [];
+  const existing = Object.hasOwn(map, key) ? map[key] : [];
   for (const t of targets) {
     if (!existing.includes(t)) existing.push(t);
   }
   if (existing.length > 0) map[key] = existing;
 }
 
+function mapRawTargetsToAbsPosix(wsDir, rawTargets) {
+  const mapped = [];
+  for (const raw of rawTargets) {
+    for (const m of mapBuiltTargetToSource(wsDir, raw, { forPaths: true })) {
+      const abs = toPosix(path.resolve(wsDir, m));
+      if (!mapped.includes(abs)) mapped.push(abs);
+    }
+  }
+  return mapped;
+}
+
+function isRealPathInsideRepo(candidatePath, realRepoRoot) {
+  let cursor = path.resolve(candidatePath);
+  while (true) {
+    if (existsSync(cursor)) {
+      try {
+        const realCursor = realpathSync(cursor);
+        const rel = path.relative(realRepoRoot, realCursor);
+        return !rel.startsWith('..') && !path.isAbsolute(rel);
+      } catch {
+        return false;
+      }
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+}
+
 function buildRepoWorkspaceAbsolutePaths(workspaces) {
-  const absPaths = {};
+  const absPaths = Object.create(null);
 
   for (const ws of workspaces) {
     const pkg = ws.pkg;
     if (!pkg || typeof pkg.name !== 'string' || !pkg.name.trim()) continue;
     const pkgName = pkg.name.trim();
-    const toAbs = (relTarget) => path.resolve(ws.dir, relTarget);
 
     const exp = pkg.exports;
     const isSubpathExportsMap =
@@ -555,20 +576,14 @@ function buildRepoWorkspaceAbsolutePaths(workspaces) {
     // 1. Root package entry (`import ... from "pkg"`)
     const rootRawTargets = [];
     if (isSubpathExportsMap) {
-      if ('.' in exp) collectStringTargets(exp['.'], rootRawTargets);
+      if (Object.hasOwn(exp, '.')) collectStringTargets(exp['.'], rootRawTargets);
     } else if (exp) {
       collectStringTargets(exp, rootRawTargets);
     }
     collectStringTargets(pkg.module, rootRawTargets);
     collectStringTargets(pkg.main, rootRawTargets);
 
-    const rootMapped = [];
-    for (const raw of rootRawTargets) {
-      for (const m of mapBuiltTargetToSource(ws.dir, raw, { forPaths: true })) {
-        const abs = toPosix(toAbs(m));
-        if (!rootMapped.includes(abs)) rootMapped.push(abs);
-      }
-    }
+    const rootMapped = mapRawTargetsToAbsPosix(ws.dir, rootRawTargets);
     if (rootMapped.length === 0 && !isSubpathExportsMap) {
       for (const fallbackStem of ['src/index', 'index']) {
         for (const ext of SOURCE_EXTS) {
@@ -590,14 +605,7 @@ function buildRepoWorkspaceAbsolutePaths(workspaces) {
         const suffix = subKey.slice(2);
         if (!suffix) continue;
         const aliasKey = `${pkgName}/${suffix}`;
-        const subRaw = collectStringTargets(subVal);
-        const subMapped = [];
-        for (const raw of subRaw) {
-          for (const m of mapBuiltTargetToSource(ws.dir, raw, { forPaths: true })) {
-            const abs = toPosix(toAbs(m));
-            if (!subMapped.includes(abs)) subMapped.push(abs);
-          }
-        }
+        const subMapped = mapRawTargetsToAbsPosix(ws.dir, collectStringTargets(subVal));
         addUniquePathTargets(absPaths, aliasKey, subMapped);
       }
     } else if (!exp && isRealDirectory(path.join(ws.dir, 'src'))) {
@@ -610,19 +618,34 @@ function buildRepoWorkspaceAbsolutePaths(workspaces) {
 
 function readLocalTsconfigPaths(wsDir, repoRoot) {
   const visited = new Set();
-  const collected = {};
+  const collected = Object.create(null);
+  let realRepoRoot;
+  try {
+    realRepoRoot = realpathSync(repoRoot);
+  } catch {
+    return collected;
+  }
 
   function visit(tsconfigPath) {
     const resolved = path.resolve(tsconfigPath);
-    // Stay strictly inside the repository checkout.
     const relToRepo = path.relative(repoRoot, resolved);
     if (relToRepo.startsWith('..') || path.isAbsolute(relToRepo)) return;
-    if (visited.has(resolved) || !isRegularFile(resolved)) return;
-    visited.add(resolved);
+    if (!isRegularFile(resolved)) return;
 
-    const parsed = readJsonFileSafe(resolved);
+    let realResolved;
+    try {
+      realResolved = realpathSync(resolved);
+    } catch {
+      return;
+    }
+    const realRelToRepo = path.relative(realRepoRoot, realResolved);
+    if (realRelToRepo.startsWith('..') || path.isAbsolute(realRelToRepo)) return;
+    if (visited.has(realResolved)) return;
+    visited.add(realResolved);
+
+    const parsed = readJsonFileSafe(realResolved);
     if (!parsed || typeof parsed !== 'object') return;
-    const cfgDir = path.dirname(resolved);
+    const cfgDir = path.dirname(realResolved);
 
     if (parsed.extends) {
       const extList = Array.isArray(parsed.extends) ? parsed.extends : [parsed.extends];
@@ -655,11 +678,16 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
         if (!Array.isArray(targets)) continue;
         const absTargets = targets
           .filter((t) => typeof t === 'string')
-          .map((t) => toPosix(path.resolve(baseDir, t)))
+          .map((t) => path.resolve(baseDir, t))
           .filter((abs) => {
-            const rel = path.relative(repoRoot, abs);
-            return !rel.startsWith('..') && !path.isAbsolute(rel);
-          });
+            const rel = path.relative(realRepoRoot, abs);
+            return (
+              !rel.startsWith('..') &&
+              !path.isAbsolute(rel) &&
+              isRealPathInsideRepo(abs, realRepoRoot)
+            );
+          })
+          .map((abs) => toPosix(abs));
         if (absTargets.length > 0) {
           collected[alias] = absTargets;
         }
@@ -672,7 +700,7 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
 }
 
 function resolveSubpathImports(wsDir, pkg) {
-  const pathsMap = {};
+  const pathsMap = Object.create(null);
   const extraEntries = [];
   if (!pkg || typeof pkg.imports !== 'object' || !pkg.imports || Array.isArray(pkg.imports)) {
     return { pathsMap, extraEntries };
@@ -680,12 +708,8 @@ function resolveSubpathImports(wsDir, pkg) {
   for (const [impKey, impVal] of Object.entries(pkg.imports)) {
     if (!impKey.startsWith('#')) continue;
     const rawTargets = collectStringTargets(impVal);
-    const mappedPaths = [];
+    const mappedPaths = mapRawTargetsToAbsPosix(wsDir, rawTargets);
     for (const raw of rawTargets) {
-      for (const m of mapBuiltTargetToSource(wsDir, raw, { forPaths: true })) {
-        const abs = toPosix(path.resolve(wsDir, m));
-        if (!mappedPaths.includes(abs)) mappedPaths.push(abs);
-      }
       for (const entryRel of mapBuiltTargetToSource(wsDir, raw, { forPaths: false })) {
         if (!entryRel.includes('*') && !extraEntries.includes(entryRel)) {
           extraEntries.push(entryRel);
@@ -719,17 +743,17 @@ export function extractDrizzleSchemas(wsDir) {
     const stripped = stripJsonc(src);
     const rawValues = [];
 
-    // Match schema: "..." or schema: '...' or schema: [ ... ]
-    const arrayMatch = /\bschema\s*:\s*\[([\s\S]*?)\]/g;
+    // Match schema: "..." / "schema": "..." / schema: [ ... ] / "schema": [ ... ]
+    const arrayMatch = /(?:(['"])schema\1|\bschema)\s*:\s*\[([\s\S]*?)\]/g;
     let m;
     while ((m = arrayMatch.exec(stripped)) !== null) {
       const litRe = /(['"])((?:\\.|(?!\1)[^\\\r\n])+)\1/g;
       let lm;
-      while ((lm = litRe.exec(m[1])) !== null) rawValues.push(lm[2]);
+      while ((lm = litRe.exec(m[2])) !== null) rawValues.push(lm[2]);
     }
-    const singleMatch = /\bschema\s*:\s*(['"])((?:\\.|(?!\1)[^\\\r\n])+)\1/g;
+    const singleMatch = /(?:(['"])schema\1|\bschema)\s*:\s*(['"])((?:\\.|(?!\2)[^\\\r\n])+)\2/g;
     while ((m = singleMatch.exec(stripped)) !== null) {
-      rawValues.push(m[2]);
+      rawValues.push(m[3]);
     }
 
     for (const raw of rawValues) {
@@ -803,14 +827,30 @@ function toRelativePosix(fromDir, absTarget) {
   return rel.startsWith('.') ? rel : `./${rel}`;
 }
 
-function globToRegExp(globPattern) {
+export function globToRegExp(globPattern) {
   let re = '^';
-  for (let i = 0; i < globPattern.length; i++) {
+  let i = 0;
+  while (i < globPattern.length) {
+    if (i === 0 && globPattern.startsWith('**/')) {
+      re += '(?:.+/)?';
+      i += 3;
+      continue;
+    }
+    if (globPattern.startsWith('/**/', i)) {
+      re += '(?:/.*)?/';
+      i += 4;
+      continue;
+    }
+    if (globPattern.slice(i) === '/**') {
+      re += '(?:/.*)?';
+      i += 3;
+      continue;
+    }
     const ch = globPattern[i];
     if (ch === '*') {
       if (globPattern[i + 1] === '*') {
+        while (globPattern[i + 1] === '*') i++;
         re += '.*';
-        i++;
       } else {
         re += '[^/]*';
       }
@@ -821,6 +861,7 @@ function globToRegExp(globPattern) {
     } else {
       re += ch;
     }
+    i++;
   }
   re += '$';
   return new RegExp(re);
@@ -847,7 +888,7 @@ function mergeIgnoreIssuesMap(target, source) {
     if (!isSafeRelativeGlob(glob) || !Array.isArray(types)) continue;
     const validTypes = types.filter((t) => typeof t === 'string' && INCLUDED_ISSUE_TYPES.includes(t));
     if (validTypes.length === 0) continue;
-    const cur = target[glob] ?? [];
+    const cur = Object.hasOwn(target, glob) ? target[glob] : [];
     for (const t of validTypes) {
       if (!cur.includes(t)) cur.push(t);
     }
@@ -884,7 +925,7 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
       if (normPattern.includes('*') || normPattern.includes('?')) {
         const matcher = globToRegExp(normPattern);
         matchedKeys = discoveredKeys.filter((k) => k !== '.' && matcher.test(k));
-      } else if (config.workspaces[normPattern]) {
+      } else if (Object.hasOwn(config.workspaces, normPattern)) {
         matchedKeys = [normPattern];
       } else if (isRealDirectory(path.join(repoRoot, normPattern))) {
         config.workspaces[normPattern] = {
@@ -892,7 +933,7 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
           entry: [...PRIVATE_ENTRY_PATTERNS, ...SHARED_ENTRY_PATTERNS],
           project: [...DEFAULT_PROJECT_PATTERNS],
           ignore: [],
-          paths: workspacesByKey.get('.')?.paths ? { ...workspacesByKey.get('.').paths } : {},
+          paths: Object.assign(Object.create(null), workspacesByKey.get('.')?.paths ?? {}),
         };
         matchedKeys = [normPattern];
       } else {
@@ -900,7 +941,7 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
       }
 
       for (const wsKey of matchedKeys) {
-        const targetWs = config.workspaces[wsKey];
+        const targetWs = Object.hasOwn(config.workspaces, wsKey) ? config.workspaces[wsKey] : null;
         if (!targetWs) continue;
         mergeUniqueStrings(targetWs.entry, wsOverride.entry);
         mergeUniqueStrings(targetWs.project, wsOverride.project);
@@ -915,7 +956,7 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
           }
         }
         if (wsOverride.ignoreIssues && typeof wsOverride.ignoreIssues === 'object') {
-          const rebased = {};
+          const rebased = Object.create(null);
           for (const [pat, types] of Object.entries(wsOverride.ignoreIssues)) {
             if (!isSafeRelativeGlob(pat)) continue;
             const fullPat = wsKey === '.' ? pat : `${wsKey}/${pat.replace(/^(?:\.\/)+/, '')}`;
@@ -928,41 +969,58 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
   }
 }
 
+function buildDefaultIgnoreIssues() {
+  const map = Object.create(null);
+  const groups = [
+    [
+      ['**/*{,.*}.config.*', '**/renovate-config.*', '**/.storybook/**', '**/*.stories.*'],
+      [...EXPORT_ONLY_ISSUE_TYPES, 'duplicates'],
+    ],
+    [
+      [
+        '**/*.setup.*',
+        '**/setupTests.*',
+        '**/scripts/**',
+        '**/bin/**',
+        '**/public/**',
+        '**/snippets/**',
+        '**/worker/**',
+        '**/workers/**',
+        '**/routes/**',
+        '**/routes.{ts,tsx,js,jsx}',
+        '**/{root,entry.client,entry.server,middleware,instrumentation}.{ts,tsx,js,jsx,mjs}',
+        '**/pages/**',
+        '**/app/**/{page,layout,route,loading,error,not-found,template,default,opengraph-image,icon,apple-icon,sitemap,robots}.{ts,tsx,js,jsx}',
+      ],
+      EXPORT_ONLY_ISSUE_TYPES,
+    ],
+    [
+      [
+        '**/*.{astro,mdx}',
+        '**/gen/**',
+        '**/generated/**',
+        '**/__generated__/**',
+        '**/*.gen.*',
+        '**/*.generated.*',
+        '**/.react-router/**',
+      ],
+      INCLUDED_ISSUE_TYPES,
+    ],
+  ];
+  for (const [patterns, issueTypes] of groups) {
+    for (const pat of patterns) {
+      map[pat] = [...issueTypes];
+    }
+  }
+  return map;
+}
+
 export function buildKnipConfig(repoRoot) {
   const workspaces = discoverWorkspaces(repoRoot);
   const repoAbsPaths = buildRepoWorkspaceAbsolutePaths(workspaces);
+  const ignoreIssues = buildDefaultIgnoreIssues();
 
-  const ignoreIssues = {
-    '**/*{,.*}.config.*': [...EXPORT_ONLY_ISSUE_TYPES, 'duplicates'],
-    '**/renovate-config.*': [...EXPORT_ONLY_ISSUE_TYPES, 'duplicates'],
-    '**/.storybook/**': [...EXPORT_ONLY_ISSUE_TYPES, 'duplicates'],
-    '**/*.stories.*': [...EXPORT_ONLY_ISSUE_TYPES, 'duplicates'],
-    '**/*.setup.*': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/setupTests.*': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/scripts/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/bin/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/public/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/snippets/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/worker/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/workers/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/routes/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/routes.{ts,tsx,js,jsx}': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/{root,entry.client,entry.server,middleware,instrumentation}.{ts,tsx,js,jsx,mjs}': [
-      ...EXPORT_ONLY_ISSUE_TYPES,
-    ],
-    '**/pages/**': [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/app/**/{page,layout,route,loading,error,not-found,template,default,opengraph-image,icon,apple-icon,sitemap,robots}.{ts,tsx,js,jsx}':
-      [...EXPORT_ONLY_ISSUE_TYPES],
-    '**/*.{astro,mdx}': [...INCLUDED_ISSUE_TYPES],
-    '**/gen/**': [...INCLUDED_ISSUE_TYPES],
-    '**/generated/**': [...INCLUDED_ISSUE_TYPES],
-    '**/__generated__/**': [...INCLUDED_ISSUE_TYPES],
-    '**/*.gen.*': [...INCLUDED_ISSUE_TYPES],
-    '**/*.generated.*': [...INCLUDED_ISSUE_TYPES],
-    '**/.react-router/**': [...INCLUDED_ISSUE_TYPES],
-  };
-
-  const knipWorkspaces = {};
+  const knipWorkspaces = Object.create(null);
   const workspacesMeta = new Map();
 
   for (const ws of workspaces) {
@@ -1004,13 +1062,15 @@ export function buildKnipConfig(repoRoot) {
     for (const pat of drizzleEntries) addEntry(pat);
 
     // Build workspace-relative `paths` combining cross-workspace packages, `#imports`, and tsconfig paths.
-    const combinedAbs = {};
+    const combinedAbs = Object.create(null);
     for (const [k, v] of Object.entries(repoAbsPaths)) addUniquePathTargets(combinedAbs, k, v);
     for (const [k, v] of Object.entries(subpathImportAbsPaths)) addUniquePathTargets(combinedAbs, k, v);
     for (const [k, v] of Object.entries(localTsPaths)) addUniquePathTargets(combinedAbs, k, v);
 
-    const wsPaths = {};
+    // Omit bare Object.prototype keys because knip@6.46.1 ProjectPrincipal.addPaths checks `key in {}`.
+    const wsPaths = Object.create(null);
     for (const [alias, absList] of Object.entries(combinedAbs)) {
+      if (alias === '__proto__' || alias in Object.prototype) continue;
       wsPaths[alias] = absList.map((absTarget) => toRelativePosix(ws.dir, absTarget));
     }
 

@@ -150,93 +150,168 @@ export function parseKnipJsonReport(reportObj, trackedFiles = null) {
   return findings;
 }
 
-export function stripCodeComments(source) {
-  let out = '';
-  let state = 'code';
-  let quote = '';
-  let escaped = false;
-  let inRegexCharClass = false;
-  let prevNonSpace = '';
+const REGEX_PREFIX_KEYWORDS = new Set([
+  'return',
+  'typeof',
+  'void',
+  'delete',
+  'throw',
+  'case',
+  'in',
+  'of',
+  'instanceof',
+  'new',
+  'await',
+  'yield',
+]);
 
-  const canStartRegex = (prev) =>
-    !prev || '=(:[!&|?+{};,~^%*<>-'.includes(prev);
+function tokenizeModuleSource(source) {
+  const tokens = [];
+  const templateBraceStack = [];
+  let i = 0;
 
-  for (let i = 0; i < source.length; i++) {
+  const canStartRegex = () => {
+    const prev = tokens[tokens.length - 1];
+    if (!prev) return true;
+    if (prev.type === 'punct') return prev.value !== ')' && prev.value !== ']';
+    if (prev.type === 'ident') return REGEX_PREFIX_KEYWORDS.has(prev.value);
+    return false;
+  };
+
+  const readTemplateChunk = () => {
+    let val = '';
+    let hasSubstitution = false;
+    while (i < source.length) {
+      const ch = source[i];
+      if (ch === '\\') {
+        val += source[i + 1] ?? '';
+        i += 2;
+        continue;
+      }
+      if (ch === '`') {
+        i++;
+        if (!hasSubstitution) {
+          tokens.push({ type: 'string', value: val });
+        } else {
+          tokens.push({ type: 'punct', value: '`' });
+        }
+        return;
+      }
+      if (ch === '$' && source[i + 1] === '{') {
+        hasSubstitution = true;
+        tokens.push({ type: 'punct', value: '${' });
+        templateBraceStack.push(0);
+        i += 2;
+        return;
+      }
+      val += ch;
+      i++;
+    }
+  };
+
+  while (i < source.length) {
     const ch = source[i];
     const next = source[i + 1];
 
-    if (state === 'lineComment') {
-      if (ch === '\n' || ch === '\r') {
-        state = 'code';
-        out += ch;
-      }
-      continue;
-    }
-    if (state === 'blockComment') {
-      if (ch === '*' && next === '/') {
-        state = 'code';
-        i++;
-      } else if (ch === '\n' || ch === '\r') {
-        out += ch;
-      }
-      continue;
-    }
-    if (state === 'string') {
-      out += ch;
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === quote || ((ch === '\n' || ch === '\r') && quote !== '`')) {
-        state = 'code';
-        prevNonSpace = quote;
-      }
-      continue;
-    }
-    if (state === 'regex') {
-      out += ch;
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === '[') {
-        inRegexCharClass = true;
-      } else if (ch === ']' && inRegexCharClass) {
-        inRegexCharClass = false;
-      } else if ((ch === '/' && !inRegexCharClass) || ch === '\n' || ch === '\r') {
-        state = 'code';
-        prevNonSpace = '/';
-      }
-      continue;
-    }
-
-    if (ch === '/' && next === '/') {
-      state = 'lineComment';
+    if (/\s/.test(ch)) {
       i++;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < source.length && source[i] !== '\n' && source[i] !== '\r') i++;
       continue;
     }
     if (ch === '/' && next === '*') {
-      state = 'blockComment';
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (ch === '/' && canStartRegex()) {
+      i++;
+      let inClass = false;
+      while (i < source.length) {
+        const rc = source[i];
+        if (rc === '\\') {
+          i += 2;
+          continue;
+        }
+        if (rc === '[') inClass = true;
+        else if (rc === ']' && inClass) inClass = false;
+        else if ((rc === '/' && !inClass) || rc === '\n' || rc === '\r') {
+          if (rc === '/') i++;
+          break;
+        }
+        i++;
+      }
+      tokens.push({ type: 'punct', value: '/' });
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      i++;
+      let val = '';
+      while (i < source.length) {
+        const sc = source[i];
+        if (sc === '\\') {
+          val += source[i + 1] ?? '';
+          i += 2;
+          continue;
+        }
+        if (sc === quote || sc === '\n' || sc === '\r') {
+          if (sc === quote) i++;
+          break;
+        }
+        val += sc;
+        i++;
+      }
+      tokens.push({ type: 'string', value: val });
+      continue;
+    }
+    if (ch === '`') {
+      i++;
+      readTemplateChunk();
+      continue;
+    }
+    if (ch === '{' && templateBraceStack.length > 0) {
+      templateBraceStack[templateBraceStack.length - 1]++;
+      tokens.push({ type: 'punct', value: '{' });
       i++;
       continue;
     }
-    if (ch === '/' && canStartRegex(prevNonSpace)) {
-      state = 'regex';
-      inRegexCharClass = false;
-      out += ch;
+    if (ch === '}' && templateBraceStack.length > 0) {
+      if (templateBraceStack[templateBraceStack.length - 1] === 0) {
+        templateBraceStack.pop();
+        tokens.push({ type: 'punct', value: '}' });
+        i++;
+        readTemplateChunk();
+        continue;
+      }
+      templateBraceStack[templateBraceStack.length - 1]--;
+      tokens.push({ type: 'punct', value: '}' });
+      i++;
       continue;
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      state = 'string';
-      quote = ch;
-      out += ch;
+    if (ch === '@' && /[A-Za-z_-]/.test(next ?? '')) {
+      let end = i + 1;
+      while (end < source.length && /[A-Za-z0-9_-]/.test(source[end])) end++;
+      tokens.push({ type: 'at', value: source.slice(i, end) });
+      i = end;
       continue;
     }
-    if (!/\s/.test(ch)) prevNonSpace = ch;
-    out += ch;
+    if (/[A-Za-z_$]/.test(ch)) {
+      let end = i + 1;
+      while (end < source.length && /[A-Za-z0-9_$]/.test(source[end])) end++;
+      tokens.push({ type: 'ident', value: source.slice(i, end) });
+      i = end;
+      continue;
+    }
+    tokens.push({ type: 'punct', value: ch });
+    i++;
   }
 
-  return out;
+  return tokens;
 }
 
 export function extractPackageNameFromSpecifier(rawSpec) {
@@ -263,22 +338,79 @@ export function extractPackageNameFromSpecifier(rawSpec) {
 }
 
 export function collectReferencedPackagesInSource(rawSource) {
-  const source = stripCodeComments(rawSource);
+  const tokens = tokenizeModuleSource(rawSource);
   const refs = new Set();
+  const addSpec = (spec) => {
+    const pkgName = extractPackageNameFromSpecifier(spec);
+    if (pkgName) refs.add(pkgName);
+  };
+  const isCloseOrComma = (tok) => tok?.type === 'punct' && (tok.value === ')' || tok.value === ',');
 
-  const patterns = [
-    /\b(?:from|import)\s*(['"])([^'"\r\n]+)\1/g,
-    /(?:\b(?:import|require)|\.resolve)\s*\(\s*(['"`])([^'"`\r\n${}]+)\1\s*\)/g,
-    /@(?:import|plugin)\s+(?:url\(\s*)?(['"])([^'"\r\n]+)\1/g,
-  ];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    const prev = tokens[i - 1];
 
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(source)) !== null) {
-      const pkgName = extractPackageNameFromSpecifier(m[2]);
-      if (pkgName) refs.add(pkgName);
+    if (tok.type === 'ident' && tok.value === 'from' && prev?.value !== '.') {
+      if (tokens[i + 1]?.type === 'string') addSpec(tokens[i + 1].value);
+      continue;
+    }
+
+    if (tok.type === 'ident' && tok.value === 'import' && prev?.value !== '.') {
+      if (tokens[i + 1]?.type === 'string') {
+        addSpec(tokens[i + 1].value);
+      } else if (
+        tokens[i + 1]?.type === 'punct' &&
+        tokens[i + 1].value === '(' &&
+        tokens[i + 2]?.type === 'string' &&
+        isCloseOrComma(tokens[i + 3])
+      ) {
+        addSpec(tokens[i + 2].value);
+      }
+      continue;
+    }
+
+    if (
+      tok.type === 'ident' &&
+      tok.value === 'require' &&
+      tokens[i + 1]?.type === 'punct' &&
+      tokens[i + 1].value === '(' &&
+      tokens[i + 2]?.type === 'string' &&
+      isCloseOrComma(tokens[i + 3])
+    ) {
+      addSpec(tokens[i + 2].value);
+      continue;
+    }
+
+    if (
+      tok.type === 'punct' &&
+      tok.value === '.' &&
+      tokens[i + 1]?.type === 'ident' &&
+      tokens[i + 1].value === 'resolve' &&
+      tokens[i + 2]?.type === 'punct' &&
+      tokens[i + 2].value === '(' &&
+      tokens[i + 3]?.type === 'string' &&
+      isCloseOrComma(tokens[i + 4])
+    ) {
+      addSpec(tokens[i + 3].value);
+      continue;
+    }
+
+    if (tok.type === 'at' && (tok.value === '@import' || tok.value === '@plugin')) {
+      if (tokens[i + 1]?.type === 'string') {
+        addSpec(tokens[i + 1].value);
+      } else if (
+        tok.value === '@import' &&
+        tokens[i + 1]?.type === 'ident' &&
+        tokens[i + 1].value === 'url' &&
+        tokens[i + 2]?.type === 'punct' &&
+        tokens[i + 2].value === '(' &&
+        tokens[i + 3]?.type === 'string'
+      ) {
+        addSpec(tokens[i + 3].value);
+      }
     }
   }
+
   return refs;
 }
 
@@ -336,7 +468,6 @@ export function findNewUnusedDependencies({
   headTrackedFiles,
   renamesOldToNew = new Map(),
 }) {
-  const allBaseDeps = new Set();
   const baseDepsByHeadManifest = new Map();
 
   for (const relPath of baseTrackedFiles) {
@@ -356,7 +487,6 @@ export function findNewUnusedDependencies({
     const mappedRel = renamesOldToNew.get(relPath) ?? relPath;
     const depSet = baseDepsByHeadManifest.get(mappedRel) ?? new Set();
     for (const dep of Object.keys(pkg.dependencies)) {
-      allBaseDeps.add(dep);
       depSet.add(dep);
     }
     baseDepsByHeadManifest.set(mappedRel, depSet);
@@ -382,7 +512,7 @@ export function findNewUnusedDependencies({
     const priorSet = baseDepsByHeadManifest.get(relPath);
     for (const dep of Object.keys(pkg.dependencies)) {
       if (dep.startsWith('@types/')) continue;
-      if (allBaseDeps.has(dep) || priorSet?.has(dep)) continue;
+      if (priorSet?.has(dep)) continue;
       candidateAdditions.push({
         manifestFile: relPath,
         depName: dep,
@@ -574,6 +704,58 @@ function emitGithubOutput(outputFile, key, value) {
   appendFileSync(outputFile, `${key}=${safeVal}\n`, 'utf8');
 }
 
+const SUMMARY_CATEGORY_LABELS = {
+  files: 'Unused file',
+  exports: 'Unused export',
+  nsExports: 'Unused namespace export',
+  types: 'Unused type',
+  nsTypes: 'Unused namespace type',
+  enumMembers: 'Unused enum member',
+  duplicates: 'Duplicate export',
+  dependencies: 'Unused dependency',
+};
+
+function formatStepSummary(report, headSha) {
+  const { base, before, after, addedCount, resolvedCount, waived, added } = report;
+  if (addedCount === 0 && resolvedCount === 0) return '';
+
+  const lines = [
+    '### Unused code',
+    '',
+    `| Category | Before \`${base.slice(0, 7)}\` | After \`${headSha.slice(0, 7)}\` |`,
+    '| --- | ---: | ---: |',
+    `| Unused files | ${before.files} | ${after.files} |`,
+    `| Unused exports & types | ${before.exports} | ${after.exports} |`,
+    `| Duplicate exports | ${before.duplicates} | ${after.duplicates} |`,
+    `| New unused dependencies | ${before.dependencies} | ${after.dependencies} |`,
+    '',
+  ];
+
+  const resolvedNote = resolvedCount ? ` · resolved ${resolvedCount} pre-existing` : '';
+  if (addedCount > 0) {
+    const noun = addedCount === 1 ? 'item' : 'items';
+    lines.push(
+      waived
+        ? `**${addedCount} new unused ${noun}** (waived via \`allow-unused\` label)${resolvedNote}.`
+        : `**${addedCount} new unused ${noun}**${resolvedNote}. Remove unused code, mark intentional stacked-PR or public exports with \`/** @public */\`, or apply the \`allow-unused\` PR label.`,
+    );
+    lines.push('');
+    for (const item of added) {
+      const label = SUMMARY_CATEGORY_LABELS[item.category] ?? item.category;
+      const sym = item.symbol ? ` — \`${item.symbol.replace(/`/g, "'")}\`` : '';
+      lines.push(`- **${label}**: \`${item.file}:${item.line}\`${sym}`);
+    }
+    if (addedCount > added.length) {
+      lines.push(`- _…and ${addedCount - added.length} more not shown_`);
+    }
+  } else {
+    const noun = resolvedCount === 1 ? 'item' : 'items';
+    lines.push(`Resolved ${resolvedCount} pre-existing unused ${noun} · 0 new.`);
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
 export function executePrCheck({
   sourceDir = process.cwd(),
   baseRef = process.env.BASE,
@@ -581,6 +763,7 @@ export function executePrCheck({
   runnerTemp = process.env.RUNNER_TEMP,
   knipInstallDir = runnerTemp ? path.join(runnerTemp, 'knip') : '',
   githubOutput = process.env.GITHUB_OUTPUT,
+  githubStepSummary = process.env.GITHUB_STEP_SUMMARY,
 } = {}) {
   if (!baseRef) {
     emitGithubOutput(githubOutput, 'state', 'unavailable');
@@ -659,6 +842,18 @@ export function executePrCheck({
 
     emitGithubOutput(githubOutput, 'report', JSON.stringify(report));
     emitGithubOutput(githubOutput, 'state', state);
+
+    if (githubStepSummary) {
+      const summaryMd = formatStepSummary(report, headSha.toLowerCase());
+      if (summaryMd) appendFileSync(githubStepSummary, summaryMd, 'utf8');
+    }
+
+    if (added.length > 0 && !waived) {
+      for (const item of report.added) {
+        const sym = item.symbol ? ` (${item.symbol})` : '';
+        console.error(`[unused-code] ${item.category}: ${item.file}:${item.line}${sym}`);
+      }
+    }
 
     const exitCode = added.length > 0 && !waived ? 1 : 0;
     return { exitCode, state, report };

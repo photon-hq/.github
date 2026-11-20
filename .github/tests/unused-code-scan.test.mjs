@@ -17,6 +17,7 @@ import {
   buildKnipConfig,
   discoverWorkspaces,
   extractDrizzleSchemas,
+  globToRegExp,
   isPublicLibrary,
   mapBuiltTargetToSource,
   parseJsonc,
@@ -25,18 +26,28 @@ import {
   collectReferencedPackagesInSource,
   diffFindings,
   executePrCheck,
+  findNewUnusedDependencies,
   runKnipScan,
 } from '../unused/scan.mjs';
 
 const KNIP_VERSION = '6.46.1';
 
-function ensureTestKnipInstall() {
-  const scratchCandidate = path.join(os.homedir(), '.capy/work/PLAT-801/knip');
-  if (existsSync(path.join(scratchCandidate, 'node_modules/.bin/knip'))) {
-    return scratchCandidate;
+function hasExpectedKnipVersion(installDir) {
+  try {
+    const pkgPath = path.join(installDir, 'node_modules/knip/package.json');
+    const binPath = path.join(installDir, 'node_modules/.bin/knip');
+    if (!existsSync(binPath) || !existsSync(pkgPath)) return false;
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    return pkg?.version === KNIP_VERSION;
+  } catch {
+    return false;
   }
+}
+
+function ensureTestKnipInstall() {
   const cached = path.join(os.tmpdir(), `unused-test-knip-${KNIP_VERSION}`);
-  if (!existsSync(path.join(cached, 'node_modules/.bin/knip'))) {
+  if (!hasExpectedKnipVersion(cached)) {
+    rmSync(cached, { recursive: true, force: true });
     mkdirSync(cached, { recursive: true });
     execFileSync(
       'npm',
@@ -44,6 +55,7 @@ function ensureTestKnipInstall() {
       { cwd: cached, stdio: 'inherit' },
     );
   }
+  assert.equal(hasExpectedKnipVersion(cached), true, `Expected knip@${KNIP_VERSION} in test cache`);
   return cached;
 }
 
@@ -512,16 +524,20 @@ test('diffFindings matches duplicate exports regardless of export order and hand
     [
       "const stripped = raw.replace(/'/g, '');",
       '// import "commented-out-pkg";',
+      'const help = \'import "string-example-pkg"\';',
+      'const doc = `Run require("template-example-pkg")`;',
+      'const dyn = await import("@acme/json-data/file.json", { with: { type: "json" } });',
       "import { helper } from '@acme/runtime/subpath';",
-      'const schema = createRequire(import.meta.url).resolve("@acme/db/outbox");',
+      'const schema = createRequire(import.meta.url).resolve("@acme/db/outbox", { paths: ["."] });',
     ].join('\n'),
   );
-  assert.deepEqual([...refs].sort(), ['@acme/db', '@acme/runtime']);
+  assert.deepEqual([...refs].sort(), ['@acme/db', '@acme/json-data', '@acme/runtime']);
 });
 
 test('tolerates repositories with JS/TS files and no root package.json without dirtying the working tree', () => {
   const knipInstallDir = ensureTestKnipInstall();
   const root = mkdtempSync(path.join(os.tmpdir(), 'unused-norootpkg-'));
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'unused-norootpkg-tmp-'));
   try {
     writeFiles(root, {
       'web/package.json': JSON.stringify({ name: 'web-ui', private: true, type: 'module' }),
@@ -534,14 +550,151 @@ test('tolerates repositories with JS/TS files and no root package.json without d
     const findings = runKnipScan({
       targetDir: root,
       knipInstallDir,
-      tempDir: path.join(root, '.tmp'),
+      tempDir,
       side: 'head',
     });
-    assert.equal(existsSync(path.join(root, 'package.json')), false);
+    const gitStatus = execFileSync('git', ['status', '--porcelain'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
+    assert.equal(gitStatus, '');
     assert.equal(findings.length, 1);
     assert.equal(findings[0].file, 'web/src/util.ts');
     assert.equal(findings[0].symbol, 'unusedWebFn');
   } finally {
     rmSync(root, { recursive: true, force: true });
+    rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('handles Object.prototype package names, realpath tsconfig containment, quoted drizzle schema, globstars, per-manifest deps, and step summary', () => {
+  const knipInstallDir = ensureTestKnipInstall();
+  const root = mkdtempSync(path.join(os.tmpdir(), 'unused-edgecases-'));
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'unused-outside-'));
+  const runnerTemp = mkdtempSync(path.join(os.tmpdir(), 'unused-summary-tmp-'));
+  try {
+    writeFiles(outside, {
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          paths: { '@escaped/*': ['./secret/*'] },
+        },
+      }),
+      'secret/index.ts': 'export const secret = 1;',
+    });
+
+    writeFiles(root, {
+      'package.json': JSON.stringify({
+        name: 'constructor',
+        private: true,
+        workspaces: ['packages/**'],
+        dependencies: { 'unused-shared': '1.0.0' },
+      }),
+      'index.ts': 'export const rootEntry = 1;',
+      'knip.json': JSON.stringify({
+        workspaces: {
+          'packages/**/tools': {
+            entry: ['custom-entry.ts'],
+          },
+        },
+      }),
+      'tsconfig.base.json': JSON.stringify({
+        compilerOptions: {
+          paths: { '@shared/*': ['./packages/tools/src/*'] },
+        },
+      }),
+      'packages/tools/package.json': JSON.stringify({
+        name: 'toString',
+        private: true,
+        exports: {
+          '.': './src/index.ts',
+          './sub': './src/index.ts',
+        },
+      }),
+      'packages/tools/tsconfig.json': JSON.stringify({
+        extends: '../../tsconfig.base.json',
+        references: [{ path: '../symlinked-escape/tsconfig.json' }],
+      }),
+      'packages/tools/drizzle.config.ts': 'export default { "schema": "./src/db/schema.ts" };',
+      'packages/tools/src/db/schema.ts': 'export const usersTable = {};',
+      'packages/tools/custom-entry.ts': 'export const directWorkspaceOverride = 1;',
+      'packages/tools/src/index.ts': 'export const runTool = () => "ok";',
+      'packages/team/tools/package.json': JSON.stringify({
+        name: 'nested-tools',
+        private: true,
+      }),
+      'packages/team/tools/custom-entry.ts':
+        'import { runTool } from "toString/sub";\nconsole.log(runTool());',
+    });
+    symlinkSync(outside, path.join(root, 'packages/symlinked-escape'));
+
+    assert.equal(globToRegExp('packages/**/tools').test('packages/tools'), true);
+    assert.equal(globToRegExp('packages/**/tools').test('packages/team/tools'), true);
+    assert.deepEqual(extractDrizzleSchemas(path.join(root, 'packages/tools')), ['src/db/schema.ts']);
+
+    const cfg = buildKnipConfig(root);
+    assert.equal(Object.hasOwn(cfg.workspaces['.'].paths, 'constructor'), false);
+    assert.equal(Object.hasOwn(cfg.workspaces['.'].paths, 'toString'), false);
+    assert.ok(Array.isArray(cfg.workspaces['.'].paths['toString/sub']));
+    assert.equal('@escaped/*' in cfg.workspaces['packages/tools'].paths, false);
+    assert.ok(Array.isArray(cfg.workspaces['packages/tools'].paths['@shared/*']));
+    assert.ok(cfg.workspaces['packages/tools'].entry.includes('custom-entry.ts'));
+    assert.ok(cfg.workspaces['packages/team/tools'].entry.includes('custom-entry.ts'));
+
+    initGitRepo(root);
+    commitAll(root, 'base');
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+
+    // Add the same unused dependency `unused-shared` to a second workspace manifest: must still be flagged!
+    writeFiles(root, {
+      'packages/tools/package.json': JSON.stringify({
+        name: 'toString',
+        private: true,
+        exports: {
+          '.': './src/index.ts',
+          './sub': './src/index.ts',
+        },
+        dependencies: { 'unused-shared': '1.0.0' },
+      }),
+    });
+    commitAll(root, 'add duplicate unused dep in second workspace');
+
+    const depFindings = findNewUnusedDependencies({
+      baseDir: root,
+      headDir: root,
+      baseTrackedFiles: new Set(['package.json', 'packages/tools/package.json']),
+      headTrackedFiles: new Set(['package.json', 'packages/tools/package.json']),
+    });
+    assert.equal(depFindings.length, 0);
+
+    const ghOutput = path.join(runnerTemp, 'github-output.txt');
+    const stepSummary = path.join(runnerTemp, 'step-summary.md');
+    writeFileSync(ghOutput, '', 'utf8');
+    writeFileSync(stepSummary, '', 'utf8');
+
+    const res = executePrCheck({
+      sourceDir: root,
+      baseRef: baseSha,
+      labelsJson: '[]',
+      runnerTemp,
+      knipInstallDir,
+      githubOutput: ghOutput,
+      githubStepSummary: stepSummary,
+    });
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.state, 'failed');
+    assert.equal(res.report.addedCount, 1);
+    assert.equal(res.report.added[0].category, 'dependencies');
+    assert.equal(res.report.added[0].file, 'packages/tools/package.json');
+    assert.equal(res.report.added[0].symbol, 'unused-shared');
+
+    const summaryMd = readFileSync(stepSummary, 'utf8');
+    assert.match(summaryMd, /### Unused code/);
+    assert.match(summaryMd, /\*\*Unused dependency\*\*: `packages\/tools\/package\.json:/);
+    assert.match(summaryMd, /`unused-shared`/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
