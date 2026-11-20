@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -44,19 +45,42 @@ function hasExpectedKnipVersion(installDir) {
   }
 }
 
+let processKnipDir = null;
+
 function ensureTestKnipInstall() {
-  const cached = path.join(os.tmpdir(), `unused-test-knip-${KNIP_VERSION}`);
-  if (!hasExpectedKnipVersion(cached)) {
-    rmSync(cached, { recursive: true, force: true });
-    mkdirSync(cached, { recursive: true });
-    execFileSync(
-      'npm',
-      ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', `knip@${KNIP_VERSION}`],
-      { cwd: cached, stdio: 'inherit' },
-    );
+  if (processKnipDir && hasExpectedKnipVersion(processKnipDir)) {
+    return processKnipDir;
   }
-  assert.equal(hasExpectedKnipVersion(cached), true, `Expected knip@${KNIP_VERSION} in test cache`);
-  return cached;
+  const shared = path.join(os.tmpdir(), `unused-test-knip-${KNIP_VERSION}`);
+  if (hasExpectedKnipVersion(shared)) {
+    processKnipDir = shared;
+    return shared;
+  }
+  const staged = mkdtempSync(path.join(os.tmpdir(), `unused-test-knip-${KNIP_VERSION}-${process.pid}-`));
+  execFileSync(
+    'npm',
+    ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', `knip@${KNIP_VERSION}`],
+    { cwd: staged, stdio: 'inherit' },
+  );
+  assert.equal(hasExpectedKnipVersion(staged), true, `Expected knip@${KNIP_VERSION} in staged dir`);
+  if (!existsSync(shared)) {
+    try {
+      renameSync(staged, shared);
+      processKnipDir = shared;
+      return shared;
+    } catch {
+      if (hasExpectedKnipVersion(shared)) {
+        rmSync(staged, { recursive: true, force: true });
+        processKnipDir = shared;
+        return shared;
+      }
+    }
+  }
+  process.once('exit', () => {
+    rmSync(staged, { recursive: true, force: true });
+  });
+  processKnipDir = staged;
+  return staged;
 }
 
 function writeFiles(rootDir, files) {
@@ -526,12 +550,21 @@ test('diffFindings matches duplicate exports regardless of export order and hand
       '// import "commented-out-pkg";',
       'const help = \'import "string-example-pkg"\';',
       'const doc = `Run require("template-example-pkg")`;',
+      'const ratio = 10 / 2; const scale = require("@acme/scale");',
+      'const fsTarget = path.resolve("not-a-module-pkg");',
       'const dyn = await import("@acme/json-data/file.json", { with: { type: "json" } });',
       "import { helper } from '@acme/runtime/subpath';",
       'const schema = createRequire(import.meta.url).resolve("@acme/db/outbox", { paths: ["."] });',
+      'const metaUrl = import.meta.resolve("@acme/meta-pkg/entry");',
     ].join('\n'),
   );
-  assert.deepEqual([...refs].sort(), ['@acme/db', '@acme/json-data', '@acme/runtime']);
+  assert.deepEqual([...refs].sort(), [
+    '@acme/db',
+    '@acme/json-data',
+    '@acme/meta-pkg',
+    '@acme/runtime',
+    '@acme/scale',
+  ]);
 });
 
 test('tolerates repositories with JS/TS files and no root package.json without dirtying the working tree', () => {
@@ -694,6 +727,128 @@ test('handles Object.prototype package names, realpath tsconfig containment, quo
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test('enforces package.json#knip preprocessor isolation, inherited tsconfig baseUrl, single-quoted drizzle globstars, brace workspace globs, explicit workspace rebasing, #imports package refs, and summary error resilience', () => {
+  const knipInstallDir = ensureTestKnipInstall();
+  const root = mkdtempSync(path.join(os.tmpdir(), 'unused-security-'));
+  const runnerTemp = mkdtempSync(path.join(os.tmpdir(), 'unused-security-tmp-'));
+  const pwnMarker = path.join(runnerTemp, 'preprocessor-ran.txt');
+  try {
+    writeFiles(root, {
+      'package.json': JSON.stringify({
+        name: 'sec-monorepo',
+        private: true,
+        workspaces: ['packages/*'],
+        knip: {
+          preprocessor: './evil-preprocessor.mjs',
+          workspaces: {
+            'packages/{web,api}/**': {
+              entry: ['extra-entry.ts'],
+            },
+            'tools/cli': {
+              entry: ['run.ts'],
+            },
+          },
+        },
+      }),
+      'evil-preprocessor.mjs': `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pwnMarker)}, 'pwned');\nexport default (r) => r;`,
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          baseUrl: './shared',
+          paths: { '@root-shared/*': ['./*'] },
+        },
+      }),
+      'shared/utils/math.ts': 'export const double = (n) => n * 2;',
+      'packages/web/package.json': JSON.stringify({
+        name: '@acme/web',
+        private: true,
+        imports: {
+          '#logger': 'pino',
+          '#unused-alias': 'unreferenced-via-alias',
+        },
+      }),
+      'packages/web/tsconfig.json': JSON.stringify({
+        extends: '../../tsconfig.json',
+        compilerOptions: {
+          paths: { '@util/*': ['utils/*'] },
+        },
+      }),
+      'packages/web/drizzle.config.ts': "export default { schema: './src/db/**/*.ts' };",
+      'packages/web/src/db/nested/tables.ts': 'export const accountsTable = {};',
+      'packages/web/extra-entry.ts':
+        'import log from "#logger";\nimport { double } from "@util/math";\nconsole.log(log, double(2));',
+      'tools/cli/run.ts': 'import { double } from "@root-shared/utils/math";\nconsole.log(double(3));',
+    });
+
+    assert.equal(globToRegExp('packages/{web,api}/**').test('packages/web'), true);
+    assert.equal(globToRegExp('packages/{web,api}/**').test('packages/api/nested'), true);
+    assert.equal(globToRegExp('packages/{web,api}/**').test('packages/other'), false);
+    assert.deepEqual(extractDrizzleSchemas(path.join(root, 'packages/web')), ['src/db/**/*.ts']);
+
+    const cfg = buildKnipConfig(root);
+    assert.deepEqual(cfg.workspaces['packages/web'].paths['@util/*'], ['../../shared/utils/*']);
+    assert.deepEqual(cfg.workspaces['tools/cli'].paths['@root-shared/*'], ['../../shared/*']);
+    assert.ok(cfg.workspaces['packages/web'].entry.includes('extra-entry.ts'));
+
+    initGitRepo(root);
+    commitAll(root, 'base');
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+
+    // Add `pino` (used only through `#logger`) and `unreferenced-direct` (unused) to packages/web/package.json.
+    writeFiles(root, {
+      'packages/web/package.json': JSON.stringify({
+        name: '@acme/web',
+        private: true,
+        dependencies: {
+          pino: '^9.0.0',
+          'unreferenced-direct': '^1.0.0',
+        },
+        imports: {
+          '#logger': 'pino',
+          '#unused-alias': 'unreferenced-via-alias',
+        },
+      }),
+    });
+    commitAll(root, 'head deps');
+
+    // Pass a directory path as `githubStepSummary` so appendFileSync throws EISDIR: must still exit 1!
+    const badSummaryDir = path.join(runnerTemp, 'summary-is-a-dir');
+    mkdirSync(badSummaryDir, { recursive: true });
+    const ghOutput = path.join(runnerTemp, 'gh-out.txt');
+    writeFileSync(ghOutput, '', 'utf8');
+
+    process.env.GH_TOKEN = 'secret-test-token-should-not-leak';
+    let res;
+    try {
+      res = executePrCheck({
+        sourceDir: root,
+        baseRef: baseSha,
+        labelsJson: '[]',
+        runnerTemp,
+        knipInstallDir,
+        githubOutput: ghOutput,
+        githubStepSummary: badSummaryDir,
+      });
+    } finally {
+      delete process.env.GH_TOKEN;
+    }
+
+    assert.equal(existsSync(pwnMarker), false, 'PR-controlled package.json#knip preprocessor must not run');
+    assert.equal(
+      execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim(),
+      '',
+    );
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.state, 'failed');
+    assert.deepEqual(
+      res.report.added.map((a) => `${a.category}:${a.symbol}`),
+      ['dependencies:unreferenced-direct'],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
     rmSync(runnerTemp, { recursive: true, force: true });
   }
 });

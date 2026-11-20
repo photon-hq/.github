@@ -67,15 +67,26 @@ jobs:
           sparse-checkout: .github/unused
           persist-credentials: false
 
+      - name: Resolve live pull request labels
+        if: github.event_name == 'pull_request' && steps.scope.outputs.scope == 'js'
+        id: pr_labels
+        continue-on-error: true
+        working-directory: .
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$PR_NUMBER" ] && live_labels="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq -c '[.labels[].name]' 2>/dev/null)"; then
+            echo "labels=$live_labels" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check newly introduced unused code
         if: github.event_name == 'pull_request' && steps.scope.outputs.scope != 'skip'
         id: scan
         timeout-minutes: 10
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ github.token }}
+          LABELS: ${{ steps.pr_labels.outputs.labels || toJSON(github.event.pull_request.labels.*.name) }}
           SCOPE_STATE: ${{ steps.scope.outputs.scope }}
           IMPL_OUTCOME: ${{ steps.implementation.outcome }}
         run: |
@@ -83,11 +94,6 @@ jobs:
             echo 'state=unavailable' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          LABELS="$EVENT_LABELS"
-          if [ -n "$PR_NUMBER" ] && live_labels="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '[.labels[].name]' 2>/dev/null)"; then
-            LABELS="$live_labels"
-          fi
-          export LABELS
           tool="$RUNNER_TEMP/knip"
           mkdir -p "$tool"
           if ! (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save "knip@$KNIP_VERSION"); then
@@ -101,7 +107,8 @@ jobs:
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     concurrency:
-      group: check-unused-code-comment-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}-${{ github.event.pull_request.head.sha || github.sha }}
+      group: check-unused-code-comment-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      queue: max
     permissions:
       pull-requests: write
     steps:
@@ -120,16 +127,21 @@ jobs:
             const target = { ...context.repo, issue_number: pr.number };
             const marker = '<!-- photon-knip -->';
             const head = pr.head.sha;
-            const isStillCurrentHead = async () => {
+            const getLiveState = async () => {
               const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
-              return current.state === 'open' && current.head.sha === head;
+              const hasLiveLabels = Array.isArray(current.labels);
+              const liveWaived = hasLiveLabels && current.labels.some(l => l?.name === 'allow-unused');
+              return { ok: current.state === 'open' && current.head.sha === head, hasLiveLabels, liveWaived };
             };
-            if (!(await isStillCurrentHead())) return;
+            const initialLive = await getLiveState();
+            if (!initialLive.ok) return;
             const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
             const matching = comments.filter(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
             const [old, ...duplicates] = matching;
             const deleteIfPresent = async () => {
-              if (!matching.length || !(await isStillCurrentHead())) return;
+              if (!matching.length) return;
+              const live = await getLiveState();
+              if (!live.ok) return;
               for (const c of matching) {
                 await github.rest.issues.deleteComment({ ...context.repo, comment_id: c.id });
               }
@@ -224,7 +236,8 @@ jobs:
             }
 
             const body = `${marker}\n### Unused code\n\n${text}`;
-            if (!(await isStillCurrentHead())) return;
+            const finalLive = await getLiveState();
+            if (!finalLive.ok || (addedCount > 0 && finalLive.hasLiveLabels && waived !== finalLive.liveWaived)) return;
             for (const dup of duplicates) {
               await github.rest.issues.deleteComment({ ...context.repo, comment_id: dup.id });
             }

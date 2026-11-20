@@ -617,7 +617,7 @@ function buildRepoWorkspaceAbsolutePaths(workspaces) {
 }
 
 function readLocalTsconfigPaths(wsDir, repoRoot) {
-  const visited = new Set();
+  const refVisited = new Set();
   const collected = Object.create(null);
   let realRepoRoot;
   try {
@@ -626,26 +626,36 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
     return collected;
   }
 
-  function visit(tsconfigPath) {
+  function resolveInsideRepo(tsconfigPath) {
     const resolved = path.resolve(tsconfigPath);
     const relToRepo = path.relative(repoRoot, resolved);
-    if (relToRepo.startsWith('..') || path.isAbsolute(relToRepo)) return;
-    if (!isRegularFile(resolved)) return;
-
-    let realResolved;
+    if (relToRepo.startsWith('..') || path.isAbsolute(relToRepo)) return null;
+    if (!isRegularFile(resolved)) return null;
     try {
-      realResolved = realpathSync(resolved);
+      const realResolved = realpathSync(resolved);
+      const realRel = path.relative(realRepoRoot, realResolved);
+      if (realRel.startsWith('..') || path.isAbsolute(realRel)) return null;
+      return realResolved;
     } catch {
-      return;
+      return null;
     }
-    const realRelToRepo = path.relative(realRepoRoot, realResolved);
-    if (realRelToRepo.startsWith('..') || path.isAbsolute(realRelToRepo)) return;
-    if (visited.has(realResolved)) return;
-    visited.add(realResolved);
+  }
+
+  function loadChain(tsconfigPath, chainSet) {
+    const realResolved = resolveInsideRepo(tsconfigPath);
+    if (!realResolved || chainSet.has(realResolved)) {
+      return { effectiveBaseDir: null, pathsMap: Object.create(null) };
+    }
+    const nextChain = new Set(chainSet);
+    nextChain.add(realResolved);
 
     const parsed = readJsonFileSafe(realResolved);
-    if (!parsed || typeof parsed !== 'object') return;
+    if (!parsed || typeof parsed !== 'object') {
+      return { effectiveBaseDir: null, pathsMap: Object.create(null) };
+    }
     const cfgDir = path.dirname(realResolved);
+    let effectiveBaseDir = null;
+    const pathsMap = Object.create(null);
 
     if (parsed.extends) {
       const extList = Array.isArray(parsed.extends) ? parsed.extends : [parsed.extends];
@@ -656,7 +666,9 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
             : isRegularFile(path.resolve(cfgDir, `${ext}.json`))
               ? path.resolve(cfgDir, `${ext}.json`)
               : path.resolve(cfgDir, ext, 'tsconfig.json');
-          visit(extTarget);
+          const parent = loadChain(extTarget, nextChain);
+          if (parent.effectiveBaseDir) effectiveBaseDir = parent.effectiveBaseDir;
+          Object.assign(pathsMap, parent.pathsMap);
         }
       }
     }
@@ -665,37 +677,52 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
       for (const ref of parsed.references) {
         if (ref && typeof ref.path === 'string') {
           const refAbs = path.resolve(cfgDir, ref.path);
-          visit(refAbs.endsWith('.json') ? refAbs : path.join(refAbs, 'tsconfig.json'));
+          const refCfg = refAbs.endsWith('.json') ? refAbs : path.join(refAbs, 'tsconfig.json');
+          const realRef = resolveInsideRepo(refCfg);
+          if (realRef && !refVisited.has(realRef)) {
+            refVisited.add(realRef);
+            const refLoaded = loadChain(realRef, new Set());
+            for (const [k, v] of Object.entries(refLoaded.pathsMap)) {
+              if (!Object.hasOwn(pathsMap, k)) pathsMap[k] = v;
+            }
+          }
         }
       }
     }
 
     const co = parsed.compilerOptions;
-    if (co && typeof co === 'object' && co.paths && typeof co.paths === 'object') {
-      const baseDir =
-        typeof co.baseUrl === 'string' ? path.resolve(cfgDir, co.baseUrl) : cfgDir;
-      for (const [alias, targets] of Object.entries(co.paths)) {
-        if (!Array.isArray(targets)) continue;
-        const absTargets = targets
-          .filter((t) => typeof t === 'string')
-          .map((t) => path.resolve(baseDir, t))
-          .filter((abs) => {
-            const rel = path.relative(realRepoRoot, abs);
-            return (
-              !rel.startsWith('..') &&
-              !path.isAbsolute(rel) &&
-              isRealPathInsideRepo(abs, realRepoRoot)
-            );
-          })
-          .map((abs) => toPosix(abs));
-        if (absTargets.length > 0) {
-          collected[alias] = absTargets;
+    if (co && typeof co === 'object') {
+      if (typeof co.baseUrl === 'string') {
+        effectiveBaseDir = path.resolve(cfgDir, co.baseUrl);
+      }
+      if (co.paths && typeof co.paths === 'object') {
+        const baseDir = effectiveBaseDir ?? cfgDir;
+        for (const [alias, targets] of Object.entries(co.paths)) {
+          if (!Array.isArray(targets)) continue;
+          const absTargets = targets
+            .filter((t) => typeof t === 'string')
+            .map((t) => path.resolve(baseDir, t))
+            .filter((abs) => {
+              const rel = path.relative(realRepoRoot, abs);
+              return (
+                !rel.startsWith('..') &&
+                !path.isAbsolute(rel) &&
+                isRealPathInsideRepo(abs, realRepoRoot)
+              );
+            })
+            .map((abs) => toPosix(abs));
+          if (absTargets.length > 0) {
+            pathsMap[alias] = absTargets;
+          }
         }
       }
     }
+
+    return { effectiveBaseDir, pathsMap };
   }
 
-  visit(path.join(wsDir, 'tsconfig.json'));
+  const rootLoaded = loadChain(path.join(wsDir, 'tsconfig.json'), new Set());
+  Object.assign(collected, rootLoaded.pathsMap);
   return collected;
 }
 
@@ -721,6 +748,181 @@ function resolveSubpathImports(wsDir, pkg) {
   return { pathsMap, extraEntries };
 }
 
+const REGEX_PREFIX_KEYWORDS = new Set([
+  'return',
+  'typeof',
+  'void',
+  'delete',
+  'throw',
+  'case',
+  'in',
+  'of',
+  'instanceof',
+  'new',
+  'await',
+  'yield',
+]);
+
+export function tokenizeModuleSource(source) {
+  const tokens = [];
+  const templateBraceStack = [];
+  let i = 0;
+
+  const canStartRegex = () => {
+    const prev = tokens[tokens.length - 1];
+    if (!prev) return true;
+    if (prev.type === 'punct') return prev.value !== ')' && prev.value !== ']';
+    if (prev.type === 'ident') return REGEX_PREFIX_KEYWORDS.has(prev.value);
+    return false;
+  };
+
+  const readTemplateChunk = () => {
+    let val = '';
+    let hasSubstitution = false;
+    while (i < source.length) {
+      const ch = source[i];
+      if (ch === '\\') {
+        val += source[i + 1] ?? '';
+        i += 2;
+        continue;
+      }
+      if (ch === '`') {
+        i++;
+        if (!hasSubstitution) {
+          tokens.push({ type: 'string', value: val });
+        } else {
+          tokens.push({ type: 'punct', value: '`' });
+        }
+        return;
+      }
+      if (ch === '$' && source[i + 1] === '{') {
+        hasSubstitution = true;
+        tokens.push({ type: 'punct', value: '${' });
+        templateBraceStack.push(0);
+        i += 2;
+        return;
+      }
+      val += ch;
+      i++;
+    }
+  };
+
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
+
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < source.length && source[i] !== '\n' && source[i] !== '\r') i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (ch === '/' && canStartRegex()) {
+      i++;
+      let inClass = false;
+      while (i < source.length) {
+        const rc = source[i];
+        if (rc === '\\') {
+          i += 2;
+          continue;
+        }
+        if (rc === '[') inClass = true;
+        else if (rc === ']' && inClass) inClass = false;
+        else if ((rc === '/' && !inClass) || rc === '\n' || rc === '\r') {
+          if (rc === '/') i++;
+          break;
+        }
+        i++;
+      }
+      tokens.push({ type: 'punct', value: '/' });
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      i++;
+      let val = '';
+      while (i < source.length) {
+        const sc = source[i];
+        if (sc === '\\') {
+          val += source[i + 1] ?? '';
+          i += 2;
+          continue;
+        }
+        if (sc === quote || sc === '\n' || sc === '\r') {
+          if (sc === quote) i++;
+          break;
+        }
+        val += sc;
+        i++;
+      }
+      tokens.push({ type: 'string', value: val });
+      continue;
+    }
+    if (ch === '`') {
+      i++;
+      readTemplateChunk();
+      continue;
+    }
+    if (ch === '{' && templateBraceStack.length > 0) {
+      templateBraceStack[templateBraceStack.length - 1]++;
+      tokens.push({ type: 'punct', value: '{' });
+      i++;
+      continue;
+    }
+    if (ch === '}' && templateBraceStack.length > 0) {
+      if (templateBraceStack[templateBraceStack.length - 1] === 0) {
+        templateBraceStack.pop();
+        tokens.push({ type: 'punct', value: '}' });
+        i++;
+        readTemplateChunk();
+        continue;
+      }
+      templateBraceStack[templateBraceStack.length - 1]--;
+      tokens.push({ type: 'punct', value: '}' });
+      i++;
+      continue;
+    }
+    if (ch === '@' && /[A-Za-z_-]/.test(next ?? '')) {
+      let end = i + 1;
+      while (end < source.length && /[A-Za-z0-9_-]/.test(source[end])) end++;
+      tokens.push({ type: 'at', value: source.slice(i, end) });
+      i = end;
+      continue;
+    }
+    if (/[0-9]/.test(ch)) {
+      let end = i + 1;
+      while (end < source.length && /[0-9A-Za-z_.]/.test(source[end])) end++;
+      tokens.push({ type: 'num', value: source.slice(i, end) });
+      i = end;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      let end = i + 1;
+      while (end < source.length && /[A-Za-z0-9_$]/.test(source[end])) end++;
+      tokens.push({ type: 'ident', value: source.slice(i, end) });
+      i = end;
+      continue;
+    }
+    tokens.push({ type: 'punct', value: ch });
+    i++;
+  }
+
+  return tokens;
+}
+
+function isPropertyKeyToken(tok, propName) {
+  return (tok?.type === 'ident' || tok?.type === 'string') && tok.value === propName;
+}
+
 export function extractDrizzleSchemas(wsDir) {
   let entries;
   try {
@@ -740,20 +942,27 @@ export function extractDrizzleSchemas(wsDir) {
     } catch {
       continue;
     }
-    const stripped = stripJsonc(src);
+    const tokens = tokenizeModuleSource(src);
     const rawValues = [];
 
-    // Match schema: "..." / "schema": "..." / schema: [ ... ] / "schema": [ ... ]
-    const arrayMatch = /(?:(['"])schema\1|\bschema)\s*:\s*\[([\s\S]*?)\]/g;
-    let m;
-    while ((m = arrayMatch.exec(stripped)) !== null) {
-      const litRe = /(['"])((?:\\.|(?!\1)[^\\\r\n])+)\1/g;
-      let lm;
-      while ((lm = litRe.exec(m[2])) !== null) rawValues.push(lm[2]);
-    }
-    const singleMatch = /(?:(['"])schema\1|\bschema)\s*:\s*(['"])((?:\\.|(?!\2)[^\\\r\n])+)\2/g;
-    while ((m = singleMatch.exec(stripped)) !== null) {
-      rawValues.push(m[3]);
+    for (let i = 0; i < tokens.length; i++) {
+      if (
+        !isPropertyKeyToken(tokens[i], 'schema') ||
+        tokens[i - 1]?.value === '.' ||
+        tokens[i + 1]?.type !== 'punct' ||
+        tokens[i + 1]?.value !== ':'
+      ) {
+        continue;
+      }
+      const valTok = tokens[i + 2];
+      if (valTok?.type === 'string') {
+        rawValues.push(valTok.value);
+      } else if (valTok?.type === 'punct' && valTok.value === '[') {
+        for (let j = i + 3; j < tokens.length; j++) {
+          if (tokens[j].type === 'punct' && tokens[j].value === ']') break;
+          if (tokens[j].type === 'string') rawValues.push(tokens[j].value);
+        }
+      }
     }
 
     for (const raw of rawValues) {
@@ -782,11 +991,17 @@ function extractReactRouterAppDir(wsDir) {
     const cfgPath = path.join(wsDir, name);
     if (!isRegularFile(cfgPath)) continue;
     try {
-      const src = stripJsonc(readFileSync(cfgPath, 'utf8'));
-      const m = src.match(/\bappDirectory\s*:\s*(['"])([^'"\r\n]+)\1/);
-      if (m) {
-        const rel = m[2].trim().replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
-        if (rel && isSafeRelativeGlob(rel)) return rel;
+      const tokens = tokenizeModuleSource(readFileSync(cfgPath, 'utf8'));
+      for (let i = 0; i < tokens.length; i++) {
+        if (
+          isPropertyKeyToken(tokens[i], 'appDirectory') &&
+          tokens[i + 1]?.type === 'punct' &&
+          tokens[i + 1]?.value === ':' &&
+          tokens[i + 2]?.type === 'string'
+        ) {
+          const rel = tokens[i + 2].value.trim().replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+          if (rel && isSafeRelativeGlob(rel)) return rel;
+        }
       }
     } catch {
       // Ignore unreadable config.
@@ -827,11 +1042,11 @@ function toRelativePosix(fromDir, absTarget) {
   return rel.startsWith('.') ? rel : `./${rel}`;
 }
 
-export function globToRegExp(globPattern) {
-  let re = '^';
+function globBodyToRegExpSource(globPattern, atStart = true) {
+  let re = '';
   let i = 0;
   while (i < globPattern.length) {
-    if (i === 0 && globPattern.startsWith('**/')) {
+    if (atStart && i === 0 && globPattern.startsWith('**/')) {
       re += '(?:.+/)?';
       i += 3;
       continue;
@@ -847,6 +1062,31 @@ export function globToRegExp(globPattern) {
       continue;
     }
     const ch = globPattern[i];
+    if (ch === '{') {
+      let depth = 1;
+      let j = i + 1;
+      const parts = [];
+      let segStart = j;
+      while (j < globPattern.length && depth > 0) {
+        if (globPattern[j] === '{') depth++;
+        else if (globPattern[j] === '}') {
+          depth--;
+          if (depth === 0) {
+            parts.push(globPattern.slice(segStart, j));
+            break;
+          }
+        } else if (globPattern[j] === ',' && depth === 1) {
+          parts.push(globPattern.slice(segStart, j));
+          segStart = j + 1;
+        }
+        j++;
+      }
+      if (depth === 0 && parts.length >= 2) {
+        re += `(?:${parts.map((p) => globBodyToRegExpSource(p, false)).join('|')})`;
+        i = j + 1;
+        continue;
+      }
+    }
     if (ch === '*') {
       if (globPattern[i + 1] === '*') {
         while (globPattern[i + 1] === '*') i++;
@@ -863,8 +1103,11 @@ export function globToRegExp(globPattern) {
     }
     i++;
   }
-  re += '$';
-  return new RegExp(re);
+  return re;
+}
+
+export function globToRegExp(globPattern) {
+  return new RegExp(`^${globBodyToRegExpSource(globPattern, true)}$`);
 }
 
 function normalizeWorkspaceKey(rawKey) {
@@ -900,9 +1143,13 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
   const localPath = ['knip.json', 'knip.jsonc']
     .map((n) => path.join(repoRoot, n))
     .find((p) => isRegularFile(p));
-  if (!localPath) return;
-
-  const local = readJsonFileSafe(localPath);
+  let local = localPath ? readJsonFileSafe(localPath) : null;
+  if (!local) {
+    const rootPkg = readJsonFileSafe(path.join(repoRoot, 'package.json'));
+    if (rootPkg && typeof rootPkg.knip === 'object' && rootPkg.knip && !Array.isArray(rootPkg.knip)) {
+      local = rootPkg.knip;
+    }
+  }
   if (!local || typeof local !== 'object' || Array.isArray(local)) return;
 
   mergeUniqueStrings(config.ignore, local.ignore);
@@ -922,18 +1169,25 @@ function mergeStaticRepoKnipConfig(repoRoot, config, workspacesByKey) {
       if (normPattern !== '.' && !isSafeRelativeGlob(normPattern)) continue;
 
       let matchedKeys;
-      if (normPattern.includes('*') || normPattern.includes('?')) {
+      if (normPattern.includes('*') || normPattern.includes('?') || normPattern.includes('{')) {
         const matcher = globToRegExp(normPattern);
         matchedKeys = discoveredKeys.filter((k) => k !== '.' && matcher.test(k));
       } else if (Object.hasOwn(config.workspaces, normPattern)) {
         matchedKeys = [normPattern];
       } else if (isRealDirectory(path.join(repoRoot, normPattern))) {
+        const wsAbsDir = path.join(repoRoot, normPattern);
+        const rebasedPaths = Object.create(null);
+        for (const [alias, relTargets] of Object.entries(workspacesByKey.get('.')?.paths ?? {})) {
+          rebasedPaths[alias] = relTargets.map((t) =>
+            toRelativePosix(wsAbsDir, path.resolve(repoRoot, t)),
+          );
+        }
         config.workspaces[normPattern] = {
           includeEntryExports: true,
           entry: [...PRIVATE_ENTRY_PATTERNS, ...SHARED_ENTRY_PATTERNS],
           project: [...DEFAULT_PROJECT_PATTERNS],
           ignore: [],
-          paths: Object.assign(Object.create(null), workspacesByKey.get('.')?.paths ?? {}),
+          paths: rebasedPaths,
         };
         matchedKeys = [normPattern];
       } else {
@@ -1089,6 +1343,11 @@ export function buildKnipConfig(repoRoot) {
   const config = {
     ignoreExportsUsedInFile: true,
     include: [...INCLUDED_ISSUE_TYPES],
+    exclude: [],
+    rules: {},
+    preprocessor: [],
+    preprocessorOptions: {},
+    asyncCompilers: {},
     ignore: [...DEFAULT_IGNORE_PATTERNS],
     ignoreIssues,
     ...DISABLED_DYNAMIC_PLUGINS,
@@ -1116,9 +1375,11 @@ export function writeKnipConfigModule(configObj, knipInstallDir, outFilePath) {
     lines.push(`import mdxCompiler from ${JSON.stringify(pathToFileURL(mdxCompilerPath).href)};`);
   }
   lines.push(`const config = ${JSON.stringify(configObj, null, 2)};`);
-  if (hasAstroCompilers) {
-    lines.push(`config.compilers = { astro: astroCompiler, mdx: mdxCompiler };`);
-  }
+  lines.push(
+    hasAstroCompilers
+      ? `config.compilers = { astro: astroCompiler, mdx: mdxCompiler };`
+      : `config.compilers = {};`,
+  );
   lines.push(`export default config;`);
   writeFileSync(outFilePath, `${lines.join('\n')}\n`, 'utf8');
 }

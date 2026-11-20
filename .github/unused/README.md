@@ -23,7 +23,7 @@ jobs:
     uses: photon-hq/.github/.github/workflows/check-unused-code.yml@REVIEWED_SHA
 ```
 
-Before enrolling a repository, confirm it can use the `blacksmith-4vcpu-ubuntu-2404` runner for same-repository pull requests (fork pull requests and the comment publisher run on `ubuntu-latest`). Concurrency is keyed per pull request and head SHA on the `comment` job so overlapping dispatches on the same commit serialize cleanly without letting slower scans from older commits cancel or replace the current head's publisher.
+Before enrolling a repository, confirm it can use the `blacksmith-4vcpu-ubuntu-2404` runner for same-repository pull requests (fork pull requests and the comment publisher run on `ubuntu-latest`). Concurrency is serialized per pull request on the `comment` job with `queue: max` so pending publishers queue without replacing each other while `scan` runs uncancelled.
 
 ## Behavior
 
@@ -45,4 +45,4 @@ Before enrolling a repository, confirm it can use the `blacksmith-4vcpu-ubuntu-2
    - Apply the `allow-unused` label on the pull request to waive the check for the entire PR (`state=waived`, `exit 0`). Explicit caller workflows that include `labeled` and `unlabeled` in `on.pull_request.types` rerun automatically when the label changes. Organization branch rulesets ignore `types:` filters and run only on `opened`, `synchronize`, and `reopened`; after applying `allow-unused` on a ruleset-enrolled repository, click **Re-run jobs** on the failed check (the `scan` step re-fetches live pull request labels from the GitHub API) or push a new commit.
 5. **Comment and job-summary policy:**
    - Clean pull requests (`0` new and `0` resolved items) post no comment.
-   - When items are newly introduced or resolved, the `scan` step writes the summary table and findings to `GITHUB_STEP_SUMMARY` (making failed findings visible on fork pull requests where `GITHUB_TOKEN` is read-only), and the `comment` job creates or updates one sticky `<!-- photon-knip -->` comment with a Before/After summary table and up to 10 direct source links (plus `<details>` overflow). If a later push resolves all findings, the prior bot comment is deleted automatically.
+   - When items are newly introduced or resolved, the `scan` step writes the summary table and findings to `GITHUB_STEP_SUMMARY` (making failed findings visible on fork pull requests where `GITHUB_TOKEN` is read-only), and the `comment` job creates or updates one sticky `<!-- photon-knip -->` comment with a Before/After summary table and up to 10 direct source links (plus `<details>` overflow). If the scan is skipped or unavailable, or a later push neither adds items nor resolves pre-existing items, any prior bot comment is deleted automatically; if a push resolves pre-existing items without adding new ones, the comment updates to a resolved-only summary.

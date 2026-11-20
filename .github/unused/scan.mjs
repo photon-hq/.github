@@ -12,8 +12,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildKnipConfig,
+  collectStringTargets,
+  globToRegExp,
   parseJsonc,
   SKIP_DIRS,
+  tokenizeModuleSource,
   writeKnipConfigModule,
 } from './config.mjs';
 
@@ -150,170 +153,6 @@ export function parseKnipJsonReport(reportObj, trackedFiles = null) {
   return findings;
 }
 
-const REGEX_PREFIX_KEYWORDS = new Set([
-  'return',
-  'typeof',
-  'void',
-  'delete',
-  'throw',
-  'case',
-  'in',
-  'of',
-  'instanceof',
-  'new',
-  'await',
-  'yield',
-]);
-
-function tokenizeModuleSource(source) {
-  const tokens = [];
-  const templateBraceStack = [];
-  let i = 0;
-
-  const canStartRegex = () => {
-    const prev = tokens[tokens.length - 1];
-    if (!prev) return true;
-    if (prev.type === 'punct') return prev.value !== ')' && prev.value !== ']';
-    if (prev.type === 'ident') return REGEX_PREFIX_KEYWORDS.has(prev.value);
-    return false;
-  };
-
-  const readTemplateChunk = () => {
-    let val = '';
-    let hasSubstitution = false;
-    while (i < source.length) {
-      const ch = source[i];
-      if (ch === '\\') {
-        val += source[i + 1] ?? '';
-        i += 2;
-        continue;
-      }
-      if (ch === '`') {
-        i++;
-        if (!hasSubstitution) {
-          tokens.push({ type: 'string', value: val });
-        } else {
-          tokens.push({ type: 'punct', value: '`' });
-        }
-        return;
-      }
-      if (ch === '$' && source[i + 1] === '{') {
-        hasSubstitution = true;
-        tokens.push({ type: 'punct', value: '${' });
-        templateBraceStack.push(0);
-        i += 2;
-        return;
-      }
-      val += ch;
-      i++;
-    }
-  };
-
-  while (i < source.length) {
-    const ch = source[i];
-    const next = source[i + 1];
-
-    if (/\s/.test(ch)) {
-      i++;
-      continue;
-    }
-    if (ch === '/' && next === '/') {
-      i += 2;
-      while (i < source.length && source[i] !== '\n' && source[i] !== '\r') i++;
-      continue;
-    }
-    if (ch === '/' && next === '*') {
-      i += 2;
-      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++;
-      i += 2;
-      continue;
-    }
-    if (ch === '/' && canStartRegex()) {
-      i++;
-      let inClass = false;
-      while (i < source.length) {
-        const rc = source[i];
-        if (rc === '\\') {
-          i += 2;
-          continue;
-        }
-        if (rc === '[') inClass = true;
-        else if (rc === ']' && inClass) inClass = false;
-        else if ((rc === '/' && !inClass) || rc === '\n' || rc === '\r') {
-          if (rc === '/') i++;
-          break;
-        }
-        i++;
-      }
-      tokens.push({ type: 'punct', value: '/' });
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      i++;
-      let val = '';
-      while (i < source.length) {
-        const sc = source[i];
-        if (sc === '\\') {
-          val += source[i + 1] ?? '';
-          i += 2;
-          continue;
-        }
-        if (sc === quote || sc === '\n' || sc === '\r') {
-          if (sc === quote) i++;
-          break;
-        }
-        val += sc;
-        i++;
-      }
-      tokens.push({ type: 'string', value: val });
-      continue;
-    }
-    if (ch === '`') {
-      i++;
-      readTemplateChunk();
-      continue;
-    }
-    if (ch === '{' && templateBraceStack.length > 0) {
-      templateBraceStack[templateBraceStack.length - 1]++;
-      tokens.push({ type: 'punct', value: '{' });
-      i++;
-      continue;
-    }
-    if (ch === '}' && templateBraceStack.length > 0) {
-      if (templateBraceStack[templateBraceStack.length - 1] === 0) {
-        templateBraceStack.pop();
-        tokens.push({ type: 'punct', value: '}' });
-        i++;
-        readTemplateChunk();
-        continue;
-      }
-      templateBraceStack[templateBraceStack.length - 1]--;
-      tokens.push({ type: 'punct', value: '}' });
-      i++;
-      continue;
-    }
-    if (ch === '@' && /[A-Za-z_-]/.test(next ?? '')) {
-      let end = i + 1;
-      while (end < source.length && /[A-Za-z0-9_-]/.test(source[end])) end++;
-      tokens.push({ type: 'at', value: source.slice(i, end) });
-      i = end;
-      continue;
-    }
-    if (/[A-Za-z_$]/.test(ch)) {
-      let end = i + 1;
-      while (end < source.length && /[A-Za-z0-9_$]/.test(source[end])) end++;
-      tokens.push({ type: 'ident', value: source.slice(i, end) });
-      i = end;
-      continue;
-    }
-    tokens.push({ type: 'punct', value: ch });
-    i++;
-  }
-
-  return tokens;
-}
-
 export function extractPackageNameFromSpecifier(rawSpec) {
   if (typeof rawSpec !== 'string') return null;
   let spec = rawSpec.trim();
@@ -337,14 +176,70 @@ export function extractPackageNameFromSpecifier(rawSpec) {
   return name || null;
 }
 
-export function collectReferencedPackagesInSource(rawSource) {
+function collectReferencedSpecifiersInSource(rawSource) {
   const tokens = tokenizeModuleSource(rawSource);
-  const refs = new Set();
+  const packages = new Set();
+  const subpathImports = new Set();
+
   const addSpec = (spec) => {
-    const pkgName = extractPackageNameFromSpecifier(spec);
-    if (pkgName) refs.add(pkgName);
+    if (typeof spec !== 'string') return;
+    const trimmed = spec.trim();
+    if (trimmed.startsWith('#')) {
+      const qIdx = trimmed.indexOf('?');
+      subpathImports.add(qIdx >= 0 ? trimmed.slice(0, qIdx) : trimmed);
+      return;
+    }
+    const pkgName = extractPackageNameFromSpecifier(trimmed);
+    if (pkgName) packages.add(pkgName);
   };
   const isCloseOrComma = (tok) => tok?.type === 'punct' && (tok.value === ')' || tok.value === ',');
+
+  const requireBindings = new Set(['require']);
+  const openParenForClose = new Map();
+  const parenStack = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok.type === 'punct' && tok.value === '(') {
+      parenStack.push(i);
+    } else if (tok.type === 'punct' && tok.value === ')' && parenStack.length > 0) {
+      openParenForClose.set(i, parenStack.pop());
+    }
+    if (
+      tok.type === 'ident' &&
+      tokens[i + 1]?.type === 'punct' &&
+      tokens[i + 1]?.value === '=' &&
+      tokens[i + 2]?.type === 'ident' &&
+      tokens[i + 2]?.value === 'createRequire' &&
+      tokens[i + 3]?.type === 'punct' &&
+      tokens[i + 3]?.value === '('
+    ) {
+      requireBindings.add(tok.value);
+    }
+  }
+
+  const isModuleResolverDot = (dotIdx) => {
+    const recv = tokens[dotIdx - 1];
+    if (recv?.type === 'ident' && requireBindings.has(recv.value) && tokens[dotIdx - 2]?.value !== '.') {
+      return true;
+    }
+    if (
+      recv?.type === 'ident' &&
+      recv.value === 'meta' &&
+      tokens[dotIdx - 2]?.type === 'punct' &&
+      tokens[dotIdx - 2]?.value === '.' &&
+      tokens[dotIdx - 3]?.type === 'ident' &&
+      tokens[dotIdx - 3]?.value === 'import'
+    ) {
+      return true;
+    }
+    if (recv?.type === 'punct' && recv.value === ')') {
+      const openIdx = openParenForClose.get(dotIdx - 1);
+      if (openIdx !== undefined && tokens[openIdx - 1]?.type === 'ident') {
+        return tokens[openIdx - 1].value === 'createRequire';
+      }
+    }
+    return false;
+  };
 
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
@@ -371,7 +266,8 @@ export function collectReferencedPackagesInSource(rawSource) {
 
     if (
       tok.type === 'ident' &&
-      tok.value === 'require' &&
+      requireBindings.has(tok.value) &&
+      prev?.value !== '.' &&
       tokens[i + 1]?.type === 'punct' &&
       tokens[i + 1].value === '(' &&
       tokens[i + 2]?.type === 'string' &&
@@ -385,11 +281,12 @@ export function collectReferencedPackagesInSource(rawSource) {
       tok.type === 'punct' &&
       tok.value === '.' &&
       tokens[i + 1]?.type === 'ident' &&
-      tokens[i + 1].value === 'resolve' &&
+      tokens[i + 1]?.value === 'resolve' &&
       tokens[i + 2]?.type === 'punct' &&
-      tokens[i + 2].value === '(' &&
+      tokens[i + 2]?.value === '(' &&
       tokens[i + 3]?.type === 'string' &&
-      isCloseOrComma(tokens[i + 4])
+      isCloseOrComma(tokens[i + 4]) &&
+      isModuleResolverDot(i)
     ) {
       addSpec(tokens[i + 3].value);
       continue;
@@ -411,7 +308,11 @@ export function collectReferencedPackagesInSource(rawSource) {
     }
   }
 
-  return refs;
+  return { packages, subpathImports };
+}
+
+export function collectReferencedPackagesInSource(rawSource) {
+  return collectReferencedSpecifiersInSource(rawSource).packages;
 }
 
 function isSkippedManifestRelPath(relPath) {
@@ -493,6 +394,7 @@ export function findNewUnusedDependencies({
   }
 
   const candidateAdditions = [];
+  const importsByDir = new Map();
   for (const relPath of [...headTrackedFiles].sort()) {
     if (path.posix.basename(relPath) !== 'package.json') continue;
     if (isSkippedManifestRelPath(relPath)) continue;
@@ -506,7 +408,11 @@ export function findNewUnusedDependencies({
     } catch {
       continue;
     }
-    if (!pkg || typeof pkg.dependencies !== 'object' || !pkg.dependencies || Array.isArray(pkg.dependencies)) {
+    if (!pkg || typeof pkg !== 'object') continue;
+    if (pkg.imports && typeof pkg.imports === 'object' && !Array.isArray(pkg.imports)) {
+      importsByDir.set(path.posix.dirname(relPath), pkg.imports);
+    }
+    if (typeof pkg.dependencies !== 'object' || !pkg.dependencies || Array.isArray(pkg.dependencies)) {
       continue;
     }
     const priorSet = baseDepsByHeadManifest.get(relPath);
@@ -523,6 +429,17 @@ export function findNewUnusedDependencies({
 
   if (candidateAdditions.length === 0) return [];
 
+  const findOwningImports = (fileRelPath) => {
+    let cur = path.posix.dirname(fileRelPath);
+    while (true) {
+      if (importsByDir.has(cur)) return importsByDir.get(cur);
+      if (cur === '.' || !cur) return null;
+      const next = path.posix.dirname(cur);
+      if (next === cur) return null;
+      cur = next;
+    }
+  };
+
   const referencedAnywhere = new Set();
   for (const relPath of headTrackedFiles) {
     if (!DEP_SCAN_EXT_RE.test(relPath)) continue;
@@ -536,8 +453,31 @@ export function findNewUnusedDependencies({
     } catch {
       continue;
     }
-    for (const pkgName of collectReferencedPackagesInSource(content)) {
+    const { packages, subpathImports } = collectReferencedSpecifiersInSource(content);
+    for (const pkgName of packages) {
       referencedAnywhere.add(pkgName);
+    }
+    if (subpathImports.size > 0) {
+      const owningImports = findOwningImports(relPath);
+      if (owningImports) {
+        for (const hashSpec of subpathImports) {
+          const matchedValues = [];
+          if (Object.hasOwn(owningImports, hashSpec)) {
+            matchedValues.push(owningImports[hashSpec]);
+          }
+          for (const [impKey, impVal] of Object.entries(owningImports)) {
+            if (impKey.includes('*') && globToRegExp(impKey).test(hashSpec)) {
+              matchedValues.push(impVal);
+            }
+          }
+          for (const val of matchedValues) {
+            for (const target of collectStringTargets(val)) {
+              const pkgName = extractPackageNameFromSpecifier(target.replace(/\*/g, 'x'));
+              if (pkgName) referencedAnywhere.add(pkgName);
+            }
+          }
+        }
+      }
     }
   }
 
@@ -636,6 +576,7 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
 
   const rootManifestPath = path.join(targetDir, 'package.json');
   let createdTempRootManifest = false;
+  let originalRootManifestBytes = null;
   try {
     try {
       lstatSync(rootManifestPath);
@@ -650,6 +591,23 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
 
     const configObj = buildKnipConfig(targetDir);
     writeKnipConfigModule(configObj, knipInstallDir, configPath);
+
+    // Strip `package.json#knip` before invoking Knip so PR-controlled preprocessors or plugins never run.
+    if (!createdTempRootManifest && lstatSync(rootManifestPath).isFile()) {
+      const rawBytes = readFileSync(rootManifestPath);
+      const parsedRoot = parseJsonc(rawBytes.toString('utf8'));
+      if (parsedRoot && typeof parsedRoot === 'object' && Object.hasOwn(parsedRoot, 'knip')) {
+        originalRootManifestBytes = rawBytes;
+        const sanitized = { ...parsedRoot };
+        delete sanitized.knip;
+        writeFileSync(rootManifestPath, `${JSON.stringify(sanitized, null, 2)}\n`, 'utf8');
+      }
+    }
+
+    const childEnv = { CI: 'true' };
+    for (const key of ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'SYSTEMROOT']) {
+      if (process.env[key]) childEnv[key] = process.env[key];
+    }
 
     const proc = spawnSync(
       knipBin,
@@ -667,7 +625,7 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
         cwd: targetDir,
         encoding: 'utf8',
         maxBuffer: 64 * 1024 * 1024,
-        env: { ...process.env, CI: 'true' },
+        env: childEnv,
       },
     );
 
@@ -692,7 +650,9 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
     const reportObj = JSON.parse(readFileSync(reportPath, 'utf8'));
     return parseKnipJsonReport(reportObj, trackedFiles);
   } finally {
-    if (createdTempRootManifest) {
+    if (originalRootManifestBytes !== null) {
+      writeFileSync(rootManifestPath, originalRootManifestBytes);
+    } else if (createdTempRootManifest) {
       rmSync(rootManifestPath, { force: true });
     }
   }
@@ -844,8 +804,15 @@ export function executePrCheck({
     emitGithubOutput(githubOutput, 'state', state);
 
     if (githubStepSummary) {
-      const summaryMd = formatStepSummary(report, headSha.toLowerCase());
-      if (summaryMd) appendFileSync(githubStepSummary, summaryMd, 'utf8');
+      try {
+        const summaryMd = formatStepSummary(report, headSha.toLowerCase());
+        if (summaryMd) appendFileSync(githubStepSummary, summaryMd, 'utf8');
+      } catch (summaryError) {
+        console.warn(
+          '[unused-code] Failed to write job summary:',
+          summaryError?.message ?? summaryError,
+        );
+      }
     }
 
     if (added.length > 0 && !waived) {

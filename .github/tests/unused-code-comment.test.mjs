@@ -271,3 +271,60 @@ test('skip and unavailable states stay silent or clean up an outdated bot commen
   assert.ok(getComments()[0].body.length < 65536);
   assert.match(getComments()[0].body, /Showing 0 of 1 findings\./);
 });
+
+test('skips stale-waiver reports on the same head SHA and cleans up duplicate bot comments', async () => {
+  const pr = {
+    number: 30,
+    state: 'open',
+    head: { sha: HEAD_SHA },
+    labels: [],
+  };
+  const context = {
+    repo: { owner: 'example', repo: 'demo' },
+    payload: { pull_request: pr },
+    serverUrl: 'https://github.com',
+  };
+  const { github, calls, getComments } = createMockGithub(pr, [
+    { id: 10, user: { login: 'github-actions[bot]' }, body: '<!-- photon-knip -->\n### Unused code\n\nfirst' },
+    { id: 11, user: { login: 'github-actions[bot]' }, body: '<!-- photon-knip -->\n### Unused code\n\ndup' },
+  ]);
+
+  // Older scan computed `waived: true`, but `allow-unused` has already been removed from live PR labels -> must not overwrite!
+  await publish(context, github, {
+    env: {
+      SCOPE: 'js',
+      STATE: 'waived',
+      REPORT: JSON.stringify({
+        base: BASE_SHA,
+        before: { files: 0, exports: 0, duplicates: 0, dependencies: 0 },
+        after: { files: 0, exports: 1, duplicates: 0, dependencies: 0 },
+        addedCount: 1,
+        resolvedCount: 0,
+        waived: true,
+        added: [{ category: 'exports', file: 'src/a.ts', symbol: 'x', line: 1 }],
+      }),
+    },
+  });
+  assert.deepEqual(calls, { created: 0, updated: 0, deleted: 0 });
+
+  // Matching `waived: false` updates primary comment and removes duplicate marker comment.
+  await publish(context, github, {
+    env: {
+      SCOPE: 'js',
+      STATE: 'failed',
+      REPORT: JSON.stringify({
+        base: BASE_SHA,
+        before: { files: 0, exports: 0, duplicates: 0, dependencies: 0 },
+        after: { files: 0, exports: 1, duplicates: 0, dependencies: 0 },
+        addedCount: 1,
+        resolvedCount: 0,
+        waived: false,
+        added: [{ category: 'exports', file: 'src/a.ts', symbol: 'x', line: 1 }],
+      }),
+    },
+  });
+  assert.deepEqual(calls, { created: 0, updated: 1, deleted: 1 });
+  assert.equal(getComments().length, 1);
+  assert.equal(getComments()[0].id, 10);
+});
+
