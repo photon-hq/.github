@@ -415,7 +415,7 @@ export function discoverWorkspaces(repoRoot) {
   return discovered;
 }
 
-export function collectStringTargets(value, out = []) {
+function collectStringTargets(value, out = []) {
   if (typeof value === 'string') {
     out.push(value);
   } else if (Array.isArray(value)) {
@@ -816,6 +816,11 @@ export function tokenizeModuleSource(source) {
     const ch = source[i];
     const next = source[i + 1];
 
+    if (i === 0 && ch === '#' && next === '!') {
+      i += 2;
+      while (i < source.length && source[i] !== '\n' && source[i] !== '\r') i++;
+      continue;
+    }
     if (/\s/.test(ch)) {
       i++;
       continue;
@@ -923,6 +928,13 @@ export function tokenizeModuleSource(source) {
       top.braces--;
       tokens.push({ type: 'punct', value: '}' });
       i++;
+      continue;
+    }
+    if (ch === '#' && /[A-Za-z_$]/.test(next ?? '')) {
+      let end = i + 2;
+      while (end < source.length && /[A-Za-z0-9_$]/.test(source[end])) end++;
+      tokens.push({ type: 'priv', value: source.slice(i, end) });
+      i = end;
       continue;
     }
     if (ch === '@' && /[A-Za-z_-]/.test(next ?? '')) {

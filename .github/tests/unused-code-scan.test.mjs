@@ -875,11 +875,13 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
         'for await (const x of stream) /require("fake-for-await-pkg")/.test(x);',
         'const ratio = (total + 1) / 2; const usedA = require("real-after-div-pkg");',
         'const half = compute() / 2; import "real-after-call-div-pkg";',
+        'class Meter { #for() { return 4; } run() { return this.#for() / require("real-after-private-for-pkg"); } }',
       ].join('\n'),
     );
     assert.deepEqual([...controlRegexRefs].sort(), [
       'real-after-call-div-pkg',
       'real-after-div-pkg',
+      'real-after-private-for-pkg',
     ]);
 
     // 2. Full repo scan with UTF-8 BOM root `package.json#knip`, `pnpm-workspace.yaml#include`,
@@ -922,6 +924,18 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
           '#svc/*': 'unused-broad-svc/*',
           '#svc/http/*': 'used-specific-svc/*',
           '#scoped/*': '@demo-ext/*',
+          '#cond-dead/*': {
+            default: './src/local-log.ts',
+            node: 'unused-after-default-pkg/*',
+          },
+          '#cond-require-only': {
+            require: 'unused-require-only-pkg',
+            default: './src/local-log.ts',
+          },
+          '#cond-live/*': {
+            node: 'used-node-cond-pkg/*',
+            default: './src/local-log.ts',
+          },
         },
       }),
       'packages/app/tsconfig.json': JSON.stringify({
@@ -933,22 +947,30 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
         'import { logMain } from "#log/main";',
         'import client from "#svc/http/v2/client";',
         'import sdk from "#scoped/used-sdk/deep/entry";',
-        'console.log(dotdotHelper(), logMain(), client, sdk);',
+        'import deadCond from "#cond-dead/main";',
+        'import reqCond from "#cond-require-only";',
+        'import liveCond from "#cond-live/main";',
+        'console.log(dotdotHelper(), logMain(), client, sdk, deadCond, reqCond, liveCond);',
       ].join('\n'),
     });
-    // Write `package.json` directly so the leading UTF-8 BOM is exact.
+    // Write `package.json` directly so the leading UTF-8 BOM is exact, and mark `pnpm-workspace.yaml` executable (`0o755`)
+    // to verify file mode restoration under `core.filemode=true`.
     writeFileSync(path.join(root, 'package.json'), bomRootPkg, 'utf8');
+    chmodSync(path.join(root, 'pnpm-workspace.yaml'), 0o755);
     assert.equal(parseJsonc(bomRootPkg).name, 'bom-monorepo');
 
     const cfg = buildKnipConfig(root);
     assert.ok(Array.isArray(cfg.workspaces['packages/app'].paths['@dotdot/*']));
 
     initGitRepo(root);
+    execFileSync('git', ['config', 'core.filemode', 'true'], { cwd: root });
     const baseSha = commitAll(root, 'base');
 
     // Add dependencies on HEAD:
-    // - `used-specific-svc` and `@demo-ext/used-sdk` are referenced via `#svc/http/v2/client` (across `/`) and `#scoped/used-sdk/deep/entry` (`*` substitution).
-    // - `unused-wildcard-log` (shadowed by exact `#log/main`), `unused-broad-svc` (shadowed by more specific `#svc/http/*`), and `@demo-ext/unused-sdk` must all be reported as unused!
+    // - `used-specific-svc`, `@demo-ext/used-sdk`, and `used-node-cond-pkg` are referenced via reachable `#imports` targets.
+    // - `unused-wildcard-log` (shadowed by exact `#log/main`), `unused-broad-svc` (shadowed by `#svc/http/*`),
+    //   `unused-after-default-pkg` (unreachable after `default`), `unused-require-only-pkg` (unreachable from ESM `import`),
+    //   and `@demo-ext/unused-sdk` must all be reported as unused!
     writeFiles(root, {
       'packages/app/package.json': JSON.stringify({
         name: '@demo/app',
@@ -956,8 +978,11 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
         dependencies: {
           'used-specific-svc': '^1.0.0',
           '@demo-ext/used-sdk': '^1.0.0',
+          'used-node-cond-pkg': '^1.0.0',
           'unused-wildcard-log': '^1.0.0',
           'unused-broad-svc': '^1.0.0',
+          'unused-after-default-pkg': '^1.0.0',
+          'unused-require-only-pkg': '^1.0.0',
           '@demo-ext/unused-sdk': '^1.0.0',
         },
         imports: {
@@ -966,6 +991,18 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
           '#svc/*': 'unused-broad-svc/*',
           '#svc/http/*': 'used-specific-svc/*',
           '#scoped/*': '@demo-ext/*',
+          '#cond-dead/*': {
+            default: './src/local-log.ts',
+            node: 'unused-after-default-pkg/*',
+          },
+          '#cond-require-only': {
+            require: 'unused-require-only-pkg',
+            default: './src/local-log.ts',
+          },
+          '#cond-live/*': {
+            node: 'used-node-cond-pkg/*',
+            default: './src/local-log.ts',
+          },
         },
       }),
     });
@@ -995,7 +1032,9 @@ test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allow
       res.report.added.map((a) => `${a.category}:${a.symbol}`),
       [
         'dependencies:@demo-ext/unused-sdk',
+        'dependencies:unused-after-default-pkg',
         'dependencies:unused-broad-svc',
+        'dependencies:unused-require-only-pkg',
         'dependencies:unused-wildcard-log',
       ],
     );

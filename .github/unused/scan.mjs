@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -17,7 +18,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildKnipConfig,
-  collectStringTargets,
   isRealPathInsideRepo,
   parseJsonc,
   SKIP_DIRS,
@@ -184,14 +184,25 @@ export function extractPackageNameFromSpecifier(rawSpec) {
 function collectReferencedSpecifiersInSource(rawSource) {
   const tokens = tokenizeModuleSource(rawSource);
   const packages = new Set();
-  const subpathImports = new Set();
+  const subpathImports = new Map();
 
-  const addSpec = (spec) => {
+  const addSpec = (spec, mode = 'import') => {
     if (typeof spec !== 'string') return;
     const trimmed = spec.trim();
     if (trimmed.startsWith('#')) {
       const qIdx = trimmed.indexOf('?');
-      subpathImports.add(qIdx >= 0 ? trimmed.slice(0, qIdx) : trimmed);
+      const cleanHash = qIdx >= 0 ? trimmed.slice(0, qIdx) : trimmed;
+      let modes = subpathImports.get(cleanHash);
+      if (!modes) {
+        modes = new Set();
+        subpathImports.set(cleanHash, modes);
+      }
+      if (mode === 'any') {
+        modes.add('import');
+        modes.add('require');
+      } else {
+        modes.add(mode);
+      }
       return;
     }
     const pkgName = extractPackageNameFromSpecifier(trimmed);
@@ -222,10 +233,10 @@ function collectReferencedSpecifiersInSource(rawSource) {
     }
   }
 
-  const isModuleResolverDot = (dotIdx) => {
+  const getModuleResolverMode = (dotIdx) => {
     const recv = tokens[dotIdx - 1];
     if (recv?.type === 'ident' && requireBindings.has(recv.value) && tokens[dotIdx - 2]?.value !== '.') {
-      return true;
+      return 'require';
     }
     if (
       recv?.type === 'ident' &&
@@ -235,15 +246,15 @@ function collectReferencedSpecifiersInSource(rawSource) {
       tokens[dotIdx - 3]?.type === 'ident' &&
       tokens[dotIdx - 3]?.value === 'import'
     ) {
-      return true;
+      return 'import';
     }
     if (recv?.type === 'punct' && recv.value === ')') {
       const openIdx = openParenForClose.get(dotIdx - 1);
       if (openIdx !== undefined && tokens[openIdx - 1]?.type === 'ident') {
-        return tokens[openIdx - 1].value === 'createRequire';
+        return tokens[openIdx - 1].value === 'createRequire' ? 'require' : null;
       }
     }
-    return false;
+    return null;
   };
 
   for (let i = 0; i < tokens.length; i++) {
@@ -251,20 +262,20 @@ function collectReferencedSpecifiersInSource(rawSource) {
     const prev = tokens[i - 1];
 
     if (tok.type === 'ident' && tok.value === 'from' && prev?.value !== '.') {
-      if (tokens[i + 1]?.type === 'string') addSpec(tokens[i + 1].value);
+      if (tokens[i + 1]?.type === 'string') addSpec(tokens[i + 1].value, 'import');
       continue;
     }
 
     if (tok.type === 'ident' && tok.value === 'import' && prev?.value !== '.') {
       if (tokens[i + 1]?.type === 'string') {
-        addSpec(tokens[i + 1].value);
+        addSpec(tokens[i + 1].value, 'import');
       } else if (
         tokens[i + 1]?.type === 'punct' &&
         tokens[i + 1].value === '(' &&
         tokens[i + 2]?.type === 'string' &&
         isCloseOrComma(tokens[i + 3])
       ) {
-        addSpec(tokens[i + 2].value);
+        addSpec(tokens[i + 2].value, 'import');
       }
       continue;
     }
@@ -278,7 +289,7 @@ function collectReferencedSpecifiersInSource(rawSource) {
       tokens[i + 2]?.type === 'string' &&
       isCloseOrComma(tokens[i + 3])
     ) {
-      addSpec(tokens[i + 2].value);
+      addSpec(tokens[i + 2].value, 'require');
       continue;
     }
 
@@ -290,16 +301,16 @@ function collectReferencedSpecifiersInSource(rawSource) {
       tokens[i + 2]?.type === 'punct' &&
       tokens[i + 2]?.value === '(' &&
       tokens[i + 3]?.type === 'string' &&
-      isCloseOrComma(tokens[i + 4]) &&
-      isModuleResolverDot(i)
+      isCloseOrComma(tokens[i + 4])
     ) {
-      addSpec(tokens[i + 3].value);
+      const resolverMode = getModuleResolverMode(i);
+      if (resolverMode) addSpec(tokens[i + 3].value, resolverMode);
       continue;
     }
 
     if (tok.type === 'at' && (tok.value === '@import' || tok.value === '@plugin')) {
       if (tokens[i + 1]?.type === 'string') {
-        addSpec(tokens[i + 1].value);
+        addSpec(tokens[i + 1].value, 'any');
       } else if (
         tok.value === '@import' &&
         tokens[i + 1]?.type === 'ident' &&
@@ -308,7 +319,7 @@ function collectReferencedSpecifiersInSource(rawSource) {
         tokens[i + 2].value === '(' &&
         tokens[i + 3]?.type === 'string'
       ) {
-        addSpec(tokens[i + 3].value);
+        addSpec(tokens[i + 3].value, 'any');
       }
     }
   }
@@ -320,9 +331,97 @@ export function collectReferencedPackagesInSource(rawSource) {
   return collectReferencedSpecifiersInSource(rawSource).packages;
 }
 
-function resolveSubpathImportTargets(owningImports, hashSpec) {
+function isValidSubpathTargetString(target) {
+  if (typeof target !== 'string' || !target) return false;
+  if (target.startsWith('./')) {
+    const segments = target.slice(2).split('/');
+    return (
+      segments.length > 0 &&
+      !segments.some(
+        (seg) => seg === '.' || seg === '..' || seg.toLowerCase() === 'node_modules',
+      )
+    );
+  }
+  if (target.startsWith('.') || target.startsWith('/') || target.startsWith('#')) {
+    return false;
+  }
+  return extractPackageNameFromSpecifier(target) !== null || URL.canParse(target);
+}
+
+function collectReachableImportTargets(
+  targetValue,
+  patternMatch,
+  mode,
+  activeConditions = new Set(),
+  excludedConditions = new Set(),
+) {
+  if (targetValue === null) {
+    return { targets: [], exhausted: true };
+  }
+  if (typeof targetValue === 'string') {
+    const resolved =
+      patternMatch !== null ? targetValue.replaceAll('*', patternMatch) : targetValue;
+    if (!isValidSubpathTargetString(resolved)) {
+      return { targets: [], exhausted: false };
+    }
+    return { targets: [resolved], exhausted: true };
+  }
+  if (Array.isArray(targetValue)) {
+    const targets = [];
+    for (const item of targetValue) {
+      const sub = collectReachableImportTargets(
+        item,
+        patternMatch,
+        mode,
+        activeConditions,
+        excludedConditions,
+      );
+      for (const t of sub.targets) targets.push(t);
+      if (sub.exhausted) return { targets, exhausted: true };
+    }
+    return { targets, exhausted: false };
+  }
+  if (targetValue && typeof targetValue === 'object') {
+    const targets = [];
+    const localExcluded = new Set(excludedConditions);
+    for (const [condKey, subVal] of Object.entries(targetValue)) {
+      if (localExcluded.has(condKey)) continue;
+      if (
+        (condKey === 'import' && mode === 'require') ||
+        (condKey === 'require' && mode === 'import')
+      ) {
+        continue;
+      }
+      const isGuaranteedTrue =
+        condKey === 'default' ||
+        (condKey === 'import' && mode === 'import') ||
+        (condKey === 'require' && mode === 'require') ||
+        activeConditions.has(condKey);
+      const nextActive = new Set(activeConditions);
+      nextActive.add(condKey);
+      const sub = collectReachableImportTargets(
+        subVal,
+        patternMatch,
+        mode,
+        nextActive,
+        localExcluded,
+      );
+      for (const t of sub.targets) targets.push(t);
+      if (isGuaranteedTrue && sub.exhausted) {
+        return { targets, exhausted: true };
+      }
+      if (!isGuaranteedTrue && sub.exhausted) {
+        localExcluded.add(condKey);
+      }
+    }
+    return { targets, exhausted: false };
+  }
+  return { targets: [], exhausted: false };
+}
+
+function resolveSubpathImportTargets(owningImports, hashSpec, mode = 'import') {
   if (!hashSpec.includes('*') && Object.hasOwn(owningImports, hashSpec)) {
-    return collectStringTargets(owningImports[hashSpec]);
+    return collectReachableImportTargets(owningImports[hashSpec], null, mode).targets;
   }
   let bestKey = null;
   let bestMatch = null;
@@ -347,9 +446,7 @@ function resolveSubpathImportTargets(owningImports, hashSpec) {
     bestMatch = hashSpec.slice(starIdx, hashSpec.length - trailer.length);
   }
   if (bestKey === null) return [];
-  return collectStringTargets(owningImports[bestKey]).map((target) =>
-    target.replaceAll('*', bestMatch),
-  );
+  return collectReachableImportTargets(owningImports[bestKey], bestMatch, mode).targets;
 }
 
 function isSkippedManifestRelPath(relPath) {
@@ -497,10 +594,12 @@ export function findNewUnusedDependencies({
     if (subpathImports.size > 0) {
       const owningImports = findOwningImports(relPath);
       if (owningImports) {
-        for (const hashSpec of subpathImports) {
-          for (const target of resolveSubpathImportTargets(owningImports, hashSpec)) {
-            const pkgName = extractPackageNameFromSpecifier(target);
-            if (pkgName) referencedAnywhere.add(pkgName);
+        for (const [hashSpec, modes] of subpathImports) {
+          for (const mode of modes) {
+            for (const target of resolveSubpathImportTargets(owningImports, hashSpec, mode)) {
+              const pkgName = extractPackageNameFromSpecifier(target);
+              if (pkgName) referencedAnywhere.add(pkgName);
+            }
           }
         }
       }
@@ -612,7 +711,10 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
       rmSync(filePath, { force: true });
       restoreEntries.push({ filePath, symlinkTarget });
     } else {
-      restoreEntries.push({ filePath, rawBytes: existingBytes ?? readFileSync(filePath) });
+      const rawBytes = existingBytes ?? readFileSync(filePath);
+      const mode = lstat.mode & 0o777;
+      rmSync(filePath, { force: true });
+      restoreEntries.push({ filePath, rawBytes, mode });
     }
   };
 
@@ -759,6 +861,9 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
         symlinkSync(entry.symlinkTarget, entry.filePath);
       } else if (entry.rawBytes !== undefined) {
         writeFileSync(entry.filePath, entry.rawBytes);
+        if (entry.mode !== undefined) {
+          chmodSync(entry.filePath, entry.mode);
+        }
       }
     }
   }
