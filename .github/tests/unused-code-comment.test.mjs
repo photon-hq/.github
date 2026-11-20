@@ -60,7 +60,12 @@ function createMockGithub(initialPr, initialComments = []) {
 }
 
 test('stays silent on clean PRs with zero new and zero resolved items', async () => {
-  const pr = { number: 12, state: 'open', head: { sha: HEAD_SHA } };
+  const pr = {
+    number: 12,
+    state: 'open',
+    head: { sha: HEAD_SHA },
+    base: { ref: 'main', sha: BASE_SHA },
+  };
   const context = {
     repo: { owner: 'example', repo: 'demo' },
     payload: { pull_request: pr },
@@ -89,7 +94,12 @@ test('stays silent on clean PRs with zero new and zero resolved items', async ()
 });
 
 test('creates, updates on resolution or waiver, escapes HTML/URLs, and deletes once clean', async () => {
-  const pr = { number: 15, state: 'open', head: { sha: HEAD_SHA } };
+  const pr = {
+    number: 15,
+    state: 'open',
+    head: { sha: HEAD_SHA },
+    base: { ref: 'main', sha: BASE_SHA },
+  };
   const context = {
     repo: { owner: 'example', repo: 'demo' },
     payload: { pull_request: pr },
@@ -233,7 +243,12 @@ test('creates, updates on resolution or waiver, escapes HTML/URLs, and deletes o
 });
 
 test('skip and unavailable states stay silent or clean up an outdated bot comment', async () => {
-  const pr = { number: 21, state: 'open', head: { sha: HEAD_SHA } };
+  const pr = {
+    number: 21,
+    state: 'open',
+    head: { sha: HEAD_SHA },
+    base: { ref: 'main', sha: BASE_SHA },
+  };
   const context = {
     repo: { owner: 'example', repo: 'demo' },
     payload: { pull_request: pr },
@@ -277,6 +292,7 @@ test('skips stale-waiver reports on the same head SHA and cleans up duplicate bo
     number: 30,
     state: 'open',
     head: { sha: HEAD_SHA },
+    base: { ref: 'main', sha: BASE_SHA },
     labels: [],
   };
   const context = {
@@ -326,5 +342,63 @@ test('skips stale-waiver reports on the same head SHA and cleans up duplicate bo
   assert.deepEqual(calls, { created: 0, updated: 1, deleted: 1 });
   assert.equal(getComments().length, 1);
   assert.equal(getComments()[0].id, 10);
+});
+
+test('skips publishing or deleting comments when the live PR base ref or base tip changed, while allowing merge-base != base tip', async () => {
+  const BASE_TIP_SHA = 'e'.repeat(40);
+  const MERGE_BASE_SHA = 'f'.repeat(40);
+  const pr = {
+    number: 42,
+    state: 'open',
+    head: { sha: HEAD_SHA },
+    base: { ref: 'feat/parent', sha: BASE_TIP_SHA },
+    labels: [],
+  };
+  const context = {
+    repo: { owner: 'example', repo: 'demo' },
+    payload: { pull_request: pr },
+    serverUrl: 'https://github.com',
+  };
+  const { github, calls, getComments, setCurrentPr } = createMockGithub(pr, [
+    { id: 20, user: { login: 'github-actions[bot]' }, body: '<!-- photon-knip -->\n### Unused code\n\ncurrent' },
+  ]);
+
+  const sampleReport = JSON.stringify({
+    base: MERGE_BASE_SHA,
+    before: { files: 0, exports: 0, duplicates: 0, dependencies: 0 },
+    after: { files: 0, exports: 1, duplicates: 0, dependencies: 0 },
+    addedCount: 1,
+    resolvedCount: 0,
+    waived: false,
+    added: [{ category: 'exports', file: 'src/a.ts', symbol: 'x', line: 1 }],
+  });
+
+  // 1. Valid scan where report `base` (merge-base) differs from `pr.base.sha` (base tip) -> updates comment!
+  await publish(context, github, {
+    env: { SCOPE: 'js', STATE: 'failed', REPORT: sampleReport },
+  });
+  assert.equal(calls.updated, 1);
+
+  // 2. PR retargeted to `main` (same head SHA) -> older scan for `feat/parent` must neither update nor delete!
+  setCurrentPr({ ...pr, base: { ref: 'main', sha: BASE_TIP_SHA } });
+  await publish(context, github, {
+    env: { SCOPE: 'js', STATE: 'failed', REPORT: sampleReport },
+  });
+  await publish(context, github, {
+    env: { SCOPE: 'skip' },
+  });
+  assert.deepEqual(calls, { created: 0, updated: 1, deleted: 0 });
+  assert.equal(getComments().length, 1);
+
+  // 3. PR base tip advanced (`BASE_TIP_SHA` -> `'9'.repeat(40)`) -> older scan must neither update nor delete!
+  setCurrentPr({ ...pr, base: { ref: 'feat/parent', sha: '9'.repeat(40) } });
+  await publish(context, github, {
+    env: { SCOPE: 'js', STATE: 'failed', REPORT: sampleReport },
+  });
+  await publish(context, github, {
+    env: { SCOPE: 'skip' },
+  });
+  assert.deepEqual(calls, { created: 0, updated: 1, deleted: 0 });
+  assert.equal(getComments().length, 1);
 });
 

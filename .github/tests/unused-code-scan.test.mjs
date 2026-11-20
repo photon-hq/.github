@@ -57,12 +57,17 @@ function ensureTestKnipInstall() {
     return shared;
   }
   const staged = mkdtempSync(path.join(os.tmpdir(), `unused-test-knip-${KNIP_VERSION}-${process.pid}-`));
-  execFileSync(
-    'npm',
-    ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', `knip@${KNIP_VERSION}`],
-    { cwd: staged, stdio: 'inherit' },
-  );
-  assert.equal(hasExpectedKnipVersion(staged), true, `Expected knip@${KNIP_VERSION} in staged dir`);
+  try {
+    execFileSync(
+      'npm',
+      ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', `knip@${KNIP_VERSION}`],
+      { cwd: staged, stdio: 'inherit' },
+    );
+    assert.equal(hasExpectedKnipVersion(staged), true, `Expected knip@${KNIP_VERSION} in staged dir`);
+  } catch (error) {
+    rmSync(staged, { recursive: true, force: true });
+    throw error;
+  }
   if (!existsSync(shared)) {
     try {
       renameSync(staged, shared);
@@ -846,6 +851,153 @@ test('enforces package.json#knip preprocessor isolation, inherited tsconfig base
     assert.deepEqual(
       res.report.added.map((a) => `${a.category}:${a.symbol}`),
       ['dependencies:unreferenced-direct'],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test('isolates pnpm-workspace.yaml#include, preserves UTF-8 BOM manifests, allows ..prefixed in-repo paths, ignores control-header regex literals, and follows Node #imports specificity and wildcard substitution', () => {
+  const knipInstallDir = ensureTestKnipInstall();
+  const root = mkdtempSync(path.join(os.tmpdir(), 'unused-pass3-'));
+  const runnerTemp = mkdtempSync(path.join(os.tmpdir(), 'unused-pass3-tmp-'));
+  const wsIncludeMarker = path.join(runnerTemp, 'pnpm-include-ran.txt');
+  const bomPreprocessorMarker = path.join(runnerTemp, 'bom-preprocessor-ran.txt');
+  try {
+    // 1. Tokenizer: regex after control headers (`if`, `while`, `for`, `for await`, `with`) must not register fake deps,
+    //    while division after parenthesized/call expressions preserves real imports following it.
+    const controlRegexRefs = collectReferencedPackagesInSource(
+      [
+        'if (ready && (count > 0)) /require("fake-if-pkg")/gi.test(line);',
+        'while (running) /import "fake-while-pkg"/.test(line);',
+        'for (const x of items) /import("fake-for-pkg")/.test(x);',
+        'for await (const x of stream) /require("fake-for-await-pkg")/.test(x);',
+        'const ratio = (total + 1) / 2; const usedA = require("real-after-div-pkg");',
+        'const half = compute() / 2; import "real-after-call-div-pkg";',
+      ].join('\n'),
+    );
+    assert.deepEqual([...controlRegexRefs].sort(), [
+      'real-after-call-div-pkg',
+      'real-after-div-pkg',
+    ]);
+
+    // 2. Full repo scan with UTF-8 BOM root `package.json#knip`, `pnpm-workspace.yaml#include`,
+    //    in-repo `..shared` tsconfig path target, and Node `#imports` exact/specificity/wildcard substitution.
+    const bomRootPkg = `\ufeff${JSON.stringify(
+      {
+        name: 'bom-monorepo',
+        private: true,
+        knip: {
+          preprocessor: './evil-bom-preprocessor.mjs',
+        },
+      },
+      null,
+      2,
+    )}\n`;
+
+    writeFiles(root, {
+      'pnpm-workspace.yaml': [
+        'packages:',
+        '  - packages/*',
+        'include:',
+        '  ./evil-workspace-include.mjs: true',
+      ].join('\n'),
+      'evil-workspace-include.mjs': `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(wsIncludeMarker)}, 'pwned');\nexport default {};`,
+      'evil-bom-preprocessor.mjs': `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(bomPreprocessorMarker)}, 'pwned');\nexport default (r) => r;`,
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          paths: {
+            '@dotdot/*': ['./..shared/*'],
+          },
+        },
+      }),
+      '..shared/util.ts': 'export const dotdotHelper = () => 42;',
+      'packages/app/package.json': JSON.stringify({
+        name: '@demo/app',
+        private: true,
+        imports: {
+          '#log/main': './src/local-log.ts',
+          '#log/*': 'unused-wildcard-log/*',
+          '#svc/*': 'unused-broad-svc/*',
+          '#svc/http/*': 'used-specific-svc/*',
+          '#scoped/*': '@demo-ext/*',
+        },
+      }),
+      'packages/app/tsconfig.json': JSON.stringify({
+        extends: '../../tsconfig.json',
+      }),
+      'packages/app/src/local-log.ts': 'export const logMain = () => "local";',
+      'packages/app/src/index.ts': [
+        'import { dotdotHelper } from "@dotdot/util";',
+        'import { logMain } from "#log/main";',
+        'import client from "#svc/http/v2/client";',
+        'import sdk from "#scoped/used-sdk/deep/entry";',
+        'console.log(dotdotHelper(), logMain(), client, sdk);',
+      ].join('\n'),
+    });
+    // Write `package.json` directly so the leading UTF-8 BOM is exact.
+    writeFileSync(path.join(root, 'package.json'), bomRootPkg, 'utf8');
+    assert.equal(parseJsonc(bomRootPkg).name, 'bom-monorepo');
+
+    const cfg = buildKnipConfig(root);
+    assert.ok(Array.isArray(cfg.workspaces['packages/app'].paths['@dotdot/*']));
+
+    initGitRepo(root);
+    const baseSha = commitAll(root, 'base');
+
+    // Add dependencies on HEAD:
+    // - `used-specific-svc` and `@demo-ext/used-sdk` are referenced via `#svc/http/v2/client` (across `/`) and `#scoped/used-sdk/deep/entry` (`*` substitution).
+    // - `unused-wildcard-log` (shadowed by exact `#log/main`), `unused-broad-svc` (shadowed by more specific `#svc/http/*`), and `@demo-ext/unused-sdk` must all be reported as unused!
+    writeFiles(root, {
+      'packages/app/package.json': JSON.stringify({
+        name: '@demo/app',
+        private: true,
+        dependencies: {
+          'used-specific-svc': '^1.0.0',
+          '@demo-ext/used-sdk': '^1.0.0',
+          'unused-wildcard-log': '^1.0.0',
+          'unused-broad-svc': '^1.0.0',
+          '@demo-ext/unused-sdk': '^1.0.0',
+        },
+        imports: {
+          '#log/main': './src/local-log.ts',
+          '#log/*': 'unused-wildcard-log/*',
+          '#svc/*': 'unused-broad-svc/*',
+          '#svc/http/*': 'used-specific-svc/*',
+          '#scoped/*': '@demo-ext/*',
+        },
+      }),
+    });
+    commitAll(root, 'head');
+
+    const res = executePrCheck({
+      sourceDir: root,
+      baseRef: baseSha,
+      labelsJson: '[]',
+      runnerTemp,
+      knipInstallDir,
+    });
+
+    assert.equal(existsSync(wsIncludeMarker), false, 'pnpm-workspace.yaml#include must not execute code');
+    assert.equal(existsSync(bomPreprocessorMarker), false, 'BOM package.json#knip must not execute code');
+    const restoredPkgBytes = readFileSync(path.join(root, 'package.json'));
+    assert.equal(restoredPkgBytes[0], 0xef);
+    assert.equal(restoredPkgBytes[1], 0xbb);
+    assert.equal(restoredPkgBytes[2], 0xbf);
+    assert.equal(
+      execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim(),
+      '',
+    );
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.state, 'failed');
+    assert.deepEqual(
+      res.report.added.map((a) => `${a.category}:${a.symbol}`),
+      [
+        'dependencies:@demo-ext/unused-sdk',
+        'dependencies:unused-broad-svc',
+        'dependencies:unused-wildcard-log',
+      ],
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

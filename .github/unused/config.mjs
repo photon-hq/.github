@@ -219,6 +219,7 @@ const DEFAULT_IGNORE_PATTERNS = [
 ];
 
 export function stripJsonc(text) {
+  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   const out = [];
   let inString = false;
   let escaped = false;
@@ -226,9 +227,9 @@ export function stripJsonc(text) {
   let inBlockComment = false;
   let pendingCommaIdx = -1;
 
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    const next = text[i + 1];
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    const next = source[i + 1];
 
     if (inLineComment) {
       if (ch === '\n' || ch === '\r') {
@@ -540,14 +541,18 @@ function mapRawTargetsToAbsPosix(wsDir, rawTargets) {
   return mapped;
 }
 
-function isRealPathInsideRepo(candidatePath, realRepoRoot) {
+function isRelativeWithinBase(baseDir, targetPath) {
+  const rel = path.relative(baseDir, targetPath);
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+export function isRealPathInsideRepo(candidatePath, realRepoRoot) {
   let cursor = path.resolve(candidatePath);
   while (true) {
     if (existsSync(cursor)) {
       try {
         const realCursor = realpathSync(cursor);
-        const rel = path.relative(realRepoRoot, realCursor);
-        return !rel.startsWith('..') && !path.isAbsolute(rel);
+        return isRelativeWithinBase(realRepoRoot, realCursor);
       } catch {
         return false;
       }
@@ -628,13 +633,11 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
 
   function resolveInsideRepo(tsconfigPath) {
     const resolved = path.resolve(tsconfigPath);
-    const relToRepo = path.relative(repoRoot, resolved);
-    if (relToRepo.startsWith('..') || path.isAbsolute(relToRepo)) return null;
+    if (!isRelativeWithinBase(repoRoot, resolved)) return null;
     if (!isRegularFile(resolved)) return null;
     try {
       const realResolved = realpathSync(resolved);
-      const realRel = path.relative(realRepoRoot, realResolved);
-      if (realRel.startsWith('..') || path.isAbsolute(realRel)) return null;
+      if (!isRelativeWithinBase(realRepoRoot, realResolved)) return null;
       return realResolved;
     } catch {
       return null;
@@ -702,14 +705,10 @@ function readLocalTsconfigPaths(wsDir, repoRoot) {
           const absTargets = targets
             .filter((t) => typeof t === 'string')
             .map((t) => path.resolve(baseDir, t))
-            .filter((abs) => {
-              const rel = path.relative(realRepoRoot, abs);
-              return (
-                !rel.startsWith('..') &&
-                !path.isAbsolute(rel) &&
-                isRealPathInsideRepo(abs, realRepoRoot)
-              );
-            })
+            .filter(
+              (abs) =>
+                isRelativeWithinBase(realRepoRoot, abs) && isRealPathInsideRepo(abs, realRepoRoot),
+            )
             .map((abs) => toPosix(abs));
           if (absTargets.length > 0) {
             pathsMap[alias] = absTargets;
@@ -763,15 +762,21 @@ const REGEX_PREFIX_KEYWORDS = new Set([
   'yield',
 ]);
 
+const CONTROL_HEADER_KEYWORDS = new Set(['if', 'while', 'for', 'with']);
+
 export function tokenizeModuleSource(source) {
   const tokens = [];
   const templateBraceStack = [];
+  const parenControlStack = [];
   let i = 0;
 
   const canStartRegex = () => {
     const prev = tokens[tokens.length - 1];
     if (!prev) return true;
-    if (prev.type === 'punct') return prev.value !== ')' && prev.value !== ']';
+    if (prev.type === 'punct') {
+      if (prev.value === ')') return Boolean(prev.closesControlHeader);
+      return prev.value !== ']';
+    }
     if (prev.type === 'ident') return REGEX_PREFIX_KEYWORDS.has(prev.value);
     return false;
   };
@@ -798,7 +803,7 @@ export function tokenizeModuleSource(source) {
       if (ch === '$' && source[i + 1] === '{') {
         hasSubstitution = true;
         tokens.push({ type: 'punct', value: '${' });
-        templateBraceStack.push(0);
+        templateBraceStack.push({ braces: 0, parenDepth: parenControlStack.length });
         i += 2;
         return;
       }
@@ -838,12 +843,15 @@ export function tokenizeModuleSource(source) {
         if (rc === '[') inClass = true;
         else if (rc === ']' && inClass) inClass = false;
         else if ((rc === '/' && !inClass) || rc === '\n' || rc === '\r') {
-          if (rc === '/') i++;
+          if (rc === '/') {
+            i++;
+            while (i < source.length && /[A-Za-z]/.test(source[i])) i++;
+          }
           break;
         }
         i++;
       }
-      tokens.push({ type: 'punct', value: '/' });
+      tokens.push({ type: 'regex', value: '/' });
       continue;
     }
     if (ch === "'" || ch === '"') {
@@ -872,21 +880,47 @@ export function tokenizeModuleSource(source) {
       readTemplateChunk();
       continue;
     }
+    if (ch === '(') {
+      const prevTok = tokens[tokens.length - 1];
+      const prevPrevTok = tokens[tokens.length - 2];
+      const isDirectControl =
+        prevTok?.type === 'ident' &&
+        CONTROL_HEADER_KEYWORDS.has(prevTok.value) &&
+        prevPrevTok?.value !== '.';
+      const isForAwaitControl =
+        prevTok?.type === 'ident' &&
+        prevTok.value === 'await' &&
+        prevPrevTok?.type === 'ident' &&
+        prevPrevTok.value === 'for' &&
+        tokens[tokens.length - 3]?.value !== '.';
+      parenControlStack.push(isDirectControl || isForAwaitControl);
+      tokens.push({ type: 'punct', value: '(' });
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      const closesControlHeader = parenControlStack.pop() === true;
+      tokens.push({ type: 'punct', value: ')', closesControlHeader });
+      i++;
+      continue;
+    }
     if (ch === '{' && templateBraceStack.length > 0) {
-      templateBraceStack[templateBraceStack.length - 1]++;
+      templateBraceStack[templateBraceStack.length - 1].braces++;
       tokens.push({ type: 'punct', value: '{' });
       i++;
       continue;
     }
     if (ch === '}' && templateBraceStack.length > 0) {
-      if (templateBraceStack[templateBraceStack.length - 1] === 0) {
+      const top = templateBraceStack[templateBraceStack.length - 1];
+      if (top.braces === 0) {
         templateBraceStack.pop();
+        parenControlStack.length = top.parenDepth;
         tokens.push({ type: 'punct', value: '}' });
         i++;
         readTemplateChunk();
         continue;
       }
-      templateBraceStack[templateBraceStack.length - 1]--;
+      top.braces--;
       tokens.push({ type: 'punct', value: '}' });
       i++;
       continue;

@@ -76,7 +76,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -n "$PR_NUMBER" ] && live_labels="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq -c '[.labels[].name]' 2>/dev/null)"; then
+          if [ -n "$PR_NUMBER" ] && live_labels="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '[.labels[].name] | tojson' 2>/dev/null)"; then
             echo "labels=$live_labels" >> "$GITHUB_OUTPUT"
           fi
 
@@ -126,12 +126,22 @@ jobs:
             if (!pr) return;
             const target = { ...context.repo, issue_number: pr.number };
             const marker = '<!-- photon-knip -->';
-            const head = pr.head.sha;
+            const head = pr.head?.sha;
+            const baseRef = pr.base?.ref;
+            const baseSha = pr.base?.sha;
             const getLiveState = async () => {
               const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
               const hasLiveLabels = Array.isArray(current.labels);
               const liveWaived = hasLiveLabels && current.labels.some(l => l?.name === 'allow-unused');
-              return { ok: current.state === 'open' && current.head.sha === head, hasLiveLabels, liveWaived };
+              const ok =
+                current.state === 'open' &&
+                Boolean(head) &&
+                current.head?.sha === head &&
+                Boolean(baseRef) &&
+                current.base?.ref === baseRef &&
+                Boolean(baseSha) &&
+                current.base?.sha === baseSha;
+              return { ok, hasLiveLabels, liveWaived };
             };
             const initialLive = await getLiveState();
             if (!initialLive.ok) return;

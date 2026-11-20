@@ -5,15 +5,20 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildKnipConfig,
   collectStringTargets,
-  globToRegExp,
+  isRealPathInsideRepo,
   parseJsonc,
   SKIP_DIRS,
   tokenizeModuleSource,
@@ -315,6 +320,38 @@ export function collectReferencedPackagesInSource(rawSource) {
   return collectReferencedSpecifiersInSource(rawSource).packages;
 }
 
+function resolveSubpathImportTargets(owningImports, hashSpec) {
+  if (!hashSpec.includes('*') && Object.hasOwn(owningImports, hashSpec)) {
+    return collectStringTargets(owningImports[hashSpec]);
+  }
+  let bestKey = null;
+  let bestMatch = null;
+  for (const impKey of Object.keys(owningImports)) {
+    const starIdx = impKey.indexOf('*');
+    if (starIdx < 0 || impKey.indexOf('*', starIdx + 1) >= 0) continue;
+    const prefix = impKey.slice(0, starIdx);
+    const trailer = impKey.slice(starIdx + 1);
+    if (
+      hashSpec.length < impKey.length ||
+      !hashSpec.startsWith(prefix) ||
+      !hashSpec.endsWith(trailer)
+    ) {
+      continue;
+    }
+    if (bestKey !== null) {
+      const bestStar = bestKey.indexOf('*');
+      if (starIdx < bestStar) continue;
+      if (starIdx === bestStar && impKey.length <= bestKey.length) continue;
+    }
+    bestKey = impKey;
+    bestMatch = hashSpec.slice(starIdx, hashSpec.length - trailer.length);
+  }
+  if (bestKey === null) return [];
+  return collectStringTargets(owningImports[bestKey]).map((target) =>
+    target.replaceAll('*', bestMatch),
+  );
+}
+
 function isSkippedManifestRelPath(relPath) {
   const parts = relPath.split('/');
   for (let i = 0; i < parts.length - 1; i++) {
@@ -461,20 +498,9 @@ export function findNewUnusedDependencies({
       const owningImports = findOwningImports(relPath);
       if (owningImports) {
         for (const hashSpec of subpathImports) {
-          const matchedValues = [];
-          if (Object.hasOwn(owningImports, hashSpec)) {
-            matchedValues.push(owningImports[hashSpec]);
-          }
-          for (const [impKey, impVal] of Object.entries(owningImports)) {
-            if (impKey.includes('*') && globToRegExp(impKey).test(hashSpec)) {
-              matchedValues.push(impVal);
-            }
-          }
-          for (const val of matchedValues) {
-            for (const target of collectStringTargets(val)) {
-              const pkgName = extractPackageNameFromSpecifier(target.replace(/\*/g, 'x'));
-              if (pkgName) referencedAnywhere.add(pkgName);
-            }
+          for (const target of resolveSubpathImportTargets(owningImports, hashSpec)) {
+            const pkgName = extractPackageNameFromSpecifier(target);
+            if (pkgName) referencedAnywhere.add(pkgName);
           }
         }
       }
@@ -574,34 +600,110 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
   const reportPath = path.join(tempDir, `knip-${side}-report.json`);
   rmSync(reportPath, { force: true });
 
+  const realTargetDir = realpathSync(targetDir);
   const rootManifestPath = path.join(targetDir, 'package.json');
-  let createdTempRootManifest = false;
-  let originalRootManifestBytes = null;
+  const pnpmWorkspacePath = path.join(targetDir, 'pnpm-workspace.yaml');
+  const yarnrcPath = path.join(targetDir, '.yarnrc.yml');
+  const restoreEntries = [];
+
+  const saveForRestore = (filePath, lstat, existingBytes = null) => {
+    if (lstat.isSymbolicLink()) {
+      const symlinkTarget = readlinkSync(filePath);
+      rmSync(filePath, { force: true });
+      restoreEntries.push({ filePath, symlinkTarget });
+    } else {
+      restoreEntries.push({ filePath, rawBytes: existingBytes ?? readFileSync(filePath) });
+    }
+  };
+
   try {
-    try {
-      lstatSync(rootManifestPath);
-    } catch {
+    const rootLstat = lstatSync(rootManifestPath, { throwIfNoEntry: false });
+    let wroteSyntheticRootManifest = false;
+    if (!rootLstat) {
+      restoreEntries.push({ filePath: rootManifestPath });
       writeFileSync(
         rootManifestPath,
         `${JSON.stringify({ name: 'workspace-root', private: true, type: 'module' })}\n`,
         'utf8',
       );
-      createdTempRootManifest = true;
+      wroteSyntheticRootManifest = true;
+    } else if (
+      rootLstat.isSymbolicLink() &&
+      (!isRealPathInsideRepo(rootManifestPath, realTargetDir) ||
+        !statSync(rootManifestPath, { throwIfNoEntry: false })?.isFile())
+    ) {
+      saveForRestore(rootManifestPath, rootLstat);
+      writeFileSync(
+        rootManifestPath,
+        `${JSON.stringify({ name: 'workspace-root', private: true, type: 'module' })}\n`,
+        'utf8',
+      );
+      wroteSyntheticRootManifest = true;
     }
 
     const configObj = buildKnipConfig(targetDir);
     writeKnipConfigModule(configObj, knipInstallDir, configPath);
 
     // Strip `package.json#knip` before invoking Knip so PR-controlled preprocessors or plugins never run.
-    if (!createdTempRootManifest && lstatSync(rootManifestPath).isFile()) {
+    if (!wroteSyntheticRootManifest && statSync(rootManifestPath, { throwIfNoEntry: false })?.isFile()) {
       const rawBytes = readFileSync(rootManifestPath);
       const parsedRoot = parseJsonc(rawBytes.toString('utf8'));
-      if (parsedRoot && typeof parsedRoot === 'object' && Object.hasOwn(parsedRoot, 'knip')) {
-        originalRootManifestBytes = rawBytes;
+      if (
+        parsedRoot &&
+        typeof parsedRoot === 'object' &&
+        !Array.isArray(parsedRoot) &&
+        'knip' in parsedRoot
+      ) {
+        saveForRestore(rootManifestPath, rootLstat, rawBytes);
         const sanitized = { ...parsedRoot };
         delete sanitized.knip;
         writeFileSync(rootManifestPath, `${JSON.stringify(sanitized, null, 2)}\n`, 'utf8');
       }
+    }
+
+    // Strip `pnpm-workspace.yaml#include` so Knip never calls `_load` on PR-controlled paths.
+    const wsLstat = lstatSync(pnpmWorkspacePath, { throwIfNoEntry: false });
+    if (wsLstat) {
+      if (
+        wsLstat.isSymbolicLink() &&
+        (!isRealPathInsideRepo(pnpmWorkspacePath, realTargetDir) ||
+          !statSync(pnpmWorkspacePath, { throwIfNoEntry: false })?.isFile())
+      ) {
+        saveForRestore(pnpmWorkspacePath, wsLstat);
+      } else if (statSync(pnpmWorkspacePath, { throwIfNoEntry: false })?.isFile()) {
+        const knipPkgPath = path.join(knipInstallDir, 'node_modules/knip/package.json');
+        if (existsSync(knipPkgPath)) {
+          const { parse: parseYaml, stringify: stringifyYaml } = createRequire(knipPkgPath)('yaml');
+          const rawWsBytes = readFileSync(pnpmWorkspacePath);
+          let parsedWs;
+          try {
+            parsedWs = parseYaml(rawWsBytes.toString('utf8').replace(/^\ufeff/, ''), {
+              logLevel: 'error',
+            });
+          } catch {
+            parsedWs = null;
+          }
+          if (
+            parsedWs &&
+            typeof parsedWs === 'object' &&
+            !Array.isArray(parsedWs) &&
+            'include' in parsedWs
+          ) {
+            saveForRestore(pnpmWorkspacePath, wsLstat, rawWsBytes);
+            const sanitizedWs = { ...parsedWs };
+            delete sanitizedWs.include;
+            writeFileSync(pnpmWorkspacePath, stringifyYaml(sanitizedWs), 'utf8');
+          }
+        } else {
+          saveForRestore(pnpmWorkspacePath, wsLstat);
+          rmSync(pnpmWorkspacePath, { force: true });
+        }
+      }
+    }
+
+    const yarnLstat = lstatSync(yarnrcPath, { throwIfNoEntry: false });
+    if (yarnLstat?.isSymbolicLink() && !isRealPathInsideRepo(yarnrcPath, realTargetDir)) {
+      saveForRestore(yarnrcPath, yarnLstat);
     }
 
     const childEnv = { CI: 'true' };
@@ -650,10 +752,14 @@ export function runKnipScan({ targetDir, knipInstallDir, tempDir, side, trackedF
     const reportObj = JSON.parse(readFileSync(reportPath, 'utf8'));
     return parseKnipJsonReport(reportObj, trackedFiles);
   } finally {
-    if (originalRootManifestBytes !== null) {
-      writeFileSync(rootManifestPath, originalRootManifestBytes);
-    } else if (createdTempRootManifest) {
-      rmSync(rootManifestPath, { force: true });
+    for (let i = restoreEntries.length - 1; i >= 0; i--) {
+      const entry = restoreEntries[i];
+      rmSync(entry.filePath, { force: true });
+      if (entry.symlinkTarget !== undefined) {
+        symlinkSync(entry.symlinkTarget, entry.filePath);
+      } else if (entry.rawBytes !== undefined) {
+        writeFileSync(entry.filePath, entry.rawBytes);
+      }
     }
   }
 }
