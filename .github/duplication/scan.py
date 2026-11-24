@@ -8,6 +8,10 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
+import baseline
+
 JS_FORMATS = ("javascript", "jsx", "typescript", "tsx")
 JS_SUFFIXES = (b".js", b".es", b".es6", b".mjs", b".cjs", b".jsx", b".ts", b".cts", b".mts", b".tsx")
 RULES = {
@@ -24,6 +28,20 @@ SEMANTIC_PROGRESS = re.compile(
     r"\d+ functions, all embeddings cached \(nomic-ai/CodeRankEmbed\))\n"
 )
 PR_MISS_LIMIT = 32
+SAME_REPO_MISS_LIMIT = 1500
+
+
+def miss_limit():
+    return SAME_REPO_MISS_LIMIT if os.getenv("SAME_REPO") == "true" else PR_MISS_LIMIT
+
+
+def current_vectors():
+    if (os.getenv("JSCPD_VERSION"), os.getenv("MODEL")) != ("5.4.3", "CodeRankEmbed"):
+        return None, b""
+    path = baseline.native_file()
+    if not path.is_symlink() and not path.exists():
+        return path, b""
+    return path, baseline.read_vectors(path)
 
 
 def git(*args, cwd=None):
@@ -63,7 +81,8 @@ def detect(mode, tool, root, side, args):
                "--reporters", "json,sarif" if mode == "exact" else "sarif", "--output", output, *args]
     with (tool / f"{mode}-{side}.log").open("w") as log:
         if mode == "semantic":
-            bounded = side == "base" or (side == "head" and os.getenv("VECTOR_BASELINE") != "true")
+            limit = miss_limit()
+            embedded = False
             with subprocess.Popen(command, cwd=root, stdout=log, stderr=subprocess.PIPE, text=True,
                                   errors="replace", start_new_session=True) as proc:
                 for line in proc.stderr:
@@ -74,12 +93,17 @@ def detect(mode, tool, root, side, args):
                         log.write(line)
                         continue
                     print(f"{side}: {line.rstrip()}", flush=True)
-                    if bounded and int(status[1] or 0) > PR_MISS_LIMIT:
+                    misses = int(status[1] or 0)
+                    if side != "seed" and misses > limit:
                         os.killpg(proc.pid, signal.SIGKILL)
                         emit("semantic_state", "limit")
-                        raise RuntimeError(f"{side}: exceeds the {PR_MISS_LIMIT}-function PR inference limit")
+                        raise RuntimeError(f"{side}: exceeds the {limit}-function PR inference limit")
+                    if side != "seed" and misses > 0:
+                        embedded = True
                 if proc.wait():
                     raise subprocess.CalledProcessError(proc.returncode, command)
+            if embedded:
+                emit("embedded", "true")
         else:
             subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
     if side == "seed":
@@ -155,11 +179,20 @@ def main(mode):
     elif mode == "structural":
         args = ["--ignore-identifiers=consistent", "--ignore-literals", "--ignore-annotations",
                 "--max-gap-lines", "2", "--similarity=0.90", "--min-nodes", "40", "--kind", "renamed,gap,ast"]
+    vector_path, prior_vectors = current_vectors() if mode == "semantic" else (None, b"")
     before = detect(mode, tool, tree, "base", args)
     if mode == "semantic":
+        _, base_vectors = current_vectors()
+        if vector_path and base_vectors and prior_vectors and base_vectors != prior_vectors:
+            base_vectors = baseline.merge_vectors(base_vectors, prior_vectors)
+            baseline.write_atomic(vector_path, base_vectors)
         # jscpd keys vectors by canonical scan path. Switch revisions at one stable path.
         git("checkout", "--quiet", "--detach", head, cwd=tree)
     after = detect(mode, tool, tree if mode == "semantic" else source, "head", args)
+    if mode == "semantic":
+        _, head_vectors = current_vectors()
+        if vector_path and base_vectors and head_vectors and head_vectors != base_vectors:
+            baseline.write_atomic(vector_path, baseline.merge_vectors(head_vectors, base_vectors))
 
     fields = os.fsdecode(git("diff", "-M", "--name-status", "-z", "--diff-filter=R", base, head)).split("\0")
     coverage_file = tool / "coverage.json"

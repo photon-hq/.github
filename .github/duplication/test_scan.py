@@ -2,12 +2,15 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from scan import added, detect, grouped
+import baseline
+from scan import added, detect, grouped, miss_limit
 
 
 class ClassificationTest(unittest.TestCase):
@@ -86,3 +89,138 @@ class ClassificationTest(unittest.TestCase):
         groups = grouped(entries, ["exact", "renamed", "gap", "ast"])
         self.assertEqual([g["count"] for g in groups.values()], [0, 1, 1, 0])
         self.assertEqual(grouped([("semantic", short, 0.8)], ["semantic"], [gapped])["semantic"]["count"], 0)
+
+    def test_semantic_miss_limits_and_embedded_output(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SAME_REPO", None)
+            self.assertEqual(miss_limit(), 32)
+        with patch.dict(os.environ, {"SAME_REPO": "false"}):
+            self.assertEqual(miss_limit(), 32)
+        with patch.dict(os.environ, {"SAME_REPO": "true"}):
+            self.assertEqual(miss_limit(), 1500)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            subprocess.run(["git", "init", "-q", root], check=True)
+            (root / "a.ts").write_text("export const a = 1;\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+
+            tool = Path(tmp) / "tool"
+            bin_dir = tool / "node_modules/.bin"
+            bin_dir.mkdir(parents=True)
+            (tool / "config.json").write_text("{}")
+            fake_jscpd = bin_dir / "jscpd"
+            fake_jscpd.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+                "out.mkdir(parents=True, exist_ok=True)\n"
+                "(out / 'jscpd-report.sarif').write_text(json.dumps({'runs': [{'results': []}]}))\n"
+                "sys.stderr.write(os.environ['FAKE_PROGRESS'])\n"
+            )
+            fake_jscpd.chmod(fake_jscpd.stat().st_mode | stat.S_IEXEC)
+            outputs = Path(tmp) / "outputs"
+
+            def run_detect(side, progress, same_repo=None):
+                outputs.write_text("")
+                env = {"GITHUB_OUTPUT": str(outputs), "FAKE_PROGRESS": progress}
+                if same_repo is not None:
+                    env["SAME_REPO"] = same_repo
+                with patch.dict(os.environ, env, clear=False):
+                    if same_repo is None:
+                        os.environ.pop("SAME_REPO", None)
+                    return detect("semantic", tool, root, side, ["--kind", "semantic"])
+
+            # Cached scan does not emit embedded=true.
+            run_detect("base", "Semantic clones (experimental): 40 functions, all embeddings cached (nomic-ai/CodeRankEmbed)\n")
+            self.assertEqual(outputs.read_text(), "")
+
+            # Fork/default allows 32 misses and emits embedded=true, but rejects 33 on both base and head.
+            run_detect("base", "Semantic clones (experimental): embedding 32 of 40 functions with nomic-ai/CodeRankEmbed on this machine, the rest cached\n", "false")
+            self.assertEqual(outputs.read_text(), "embedded=true\n")
+            for side in ("base", "head"):
+                with self.assertRaisesRegex(RuntimeError, f"{side}: exceeds the 32-function PR inference limit"):
+                    run_detect(side, "Semantic clones (experimental): embedding 33 functions with nomic-ai/CodeRankEmbed on this machine\n", "false")
+                self.assertEqual(outputs.read_text(), "semantic_state=limit\n")
+
+            # Same-repo Blacksmith allows up to 1500 misses per side and rejects 1501.
+            run_detect("base", "Semantic clones (experimental): embedding 1500 functions with nomic-ai/CodeRankEmbed on this machine\n", "true")
+            self.assertEqual(outputs.read_text(), "embedded=true\n")
+            with self.assertRaisesRegex(RuntimeError, "head: exceeds the 1500-function PR inference limit"):
+                run_detect("head", "Semantic clones (experimental): embedding 1501 of 1600 functions with nomic-ai/CodeRankEmbed on this machine, the rest cached\n", "true")
+            self.assertEqual(outputs.read_text(), "semantic_state=limit\n")
+
+    def test_semantic_main_preserves_prior_and_base_vectors_under_isolated_python(self):
+        script = Path(__file__).with_name("scan.py").resolve()
+
+        def rec(byte_val):
+            return bytes([byte_val]) * 16 + bytes([byte_val]) * (baseline.RECORD - 16)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            subprocess.run(["git", "init", "-q", root], check=True)
+            git_env = {**os.environ, "EMAIL": "fixture@example.invalid"}
+            (root / "a.js").write_text("export function alpha() { return 1; }\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, env=git_env, check=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+
+            (root / "a.js").write_text("export function beta() { return 2; }\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "head"], cwd=root, env=git_env, check=True)
+
+            runner = Path(tmp) / "runner"
+            tool = runner / "jscpd"
+            bin_dir = tool / "node_modules/.bin"
+            bin_dir.mkdir(parents=True)
+            (tool / "config.json").write_text("{}")
+            (tool / "coverage.json").write_text("[]")
+            subprocess.run(["git", "worktree", "add", "--quiet", "--detach", str(tool / "base"), base_sha],
+                           cwd=root, check=True)
+
+            env = {
+                **os.environ,
+                "RUNNER_TEMP": str(runner),
+                "JSCPD_CACHE_DIR": str(Path(tmp) / "cache"),
+                "JSCPD_VERSION": "5.4.3",
+                "MODEL": "CodeRankEmbed",
+                "BASE": base_sha,
+                "SAME_REPO": "true",
+                "GITHUB_OUTPUT": str(Path(tmp) / "outputs"),
+            }
+            with patch.dict(os.environ, env):
+                native = baseline.native_file()
+            native.parent.mkdir(parents=True, exist_ok=True)
+            # Prior cache holds rec(9); base rewrite drops rec(9), head sees rec(9) restored and rewrites only rec(2),
+            # and final merge retains rec(2), rec(1), and rec(9).
+            native.write_bytes(baseline.HEADER + rec(9))
+
+            fake_jscpd = bin_dir / "jscpd"
+            fake_jscpd.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"native = pathlib.Path({str(native)!r})\n"
+                f"header = {baseline.HEADER!r}\n"
+                f"rec1, rec2, rec9 = {rec(1)!r}, {rec(2)!r}, {rec(9)!r}\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+                "out.mkdir(parents=True, exist_ok=True)\n"
+                "(out / 'jscpd-report.sarif').write_text(json.dumps({'runs': [{'results': []}]}))\n"
+                "if out.name.endswith('-base'):\n"
+                "    native.write_bytes(header + rec1)\n"
+                "    sys.stderr.write('Semantic clones (experimental): embedding 1 functions with nomic-ai/CodeRankEmbed on this machine\\n')\n"
+                "else:\n"
+                "    assert rec9 in native.read_bytes(), 'prior vector should survive base rewrite'\n"
+                "    native.write_bytes(header + rec2)\n"
+                "    sys.stderr.write('Semantic clones (experimental): embedding 1 of 2 functions with nomic-ai/CodeRankEmbed on this machine, the rest cached\\n')\n"
+            )
+            fake_jscpd.chmod(fake_jscpd.stat().st_mode | stat.S_IEXEC)
+
+            Path(env["GITHUB_OUTPUT"]).write_text("")
+            subprocess.run([sys.executable, "-I", script, "semantic"], cwd=root, env=env, check=True)
+            self.assertEqual(native.read_bytes(), baseline.HEADER + rec(2) + rec(1) + rec(9))
+            output_lines = Path(env["GITHUB_OUTPUT"]).read_text().splitlines()
+            self.assertIn("embedded=true", output_lines)
+
+
+if __name__ == "__main__":
+    unittest.main()

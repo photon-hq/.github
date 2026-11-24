@@ -2,6 +2,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +11,10 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import baseline
+
+
+def make_record(key_byte, payload_byte=0):
+    return bytes([key_byte]) * 16 + bytes([payload_byte]) * (baseline.RECORD - 16)
 
 
 RUN = {
@@ -124,6 +130,104 @@ class BaselineTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 baseline.stage()
             self.assertEqual(self.output.read_text(), "")
+
+    def test_pr_cache_restore_merge_and_stage(self):
+        script = Path(baseline.__file__).resolve()
+        native = baseline.native_file()
+        staged = baseline.pr_file()
+
+        # Missing PR cache and missing native file are clean no-ops.
+        baseline.apply_pr()
+        baseline.stage_pr()
+        self.assertEqual(self.output.read_text(), "")
+        self.assertFalse(native.exists())
+        self.assertFalse(staged.exists())
+
+        # Unseeded repo: apply-pr restores and deduplicates PR cache records.
+        rec1 = make_record(1, 10)
+        rec1_dup = make_record(1, 99)
+        rec2 = make_record(2, 20)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(baseline.HEADER + rec1 + rec1_dup + rec2)
+        subprocess.run([sys.executable, "-I", script, "apply-pr"], check=True)
+        self.assertEqual(self.output.read_text(), "restored=true\n")
+        self.assertEqual(native.read_bytes(), baseline.HEADER + rec1 + rec2)
+
+        # Seeded repo + PR cache: seed records stay first (including hash collisions), unseen PR records append.
+        self.output.write_text("")
+        seed_rec1 = make_record(1, 11)
+        seed_rec3 = make_record(3, 33)
+        pr_rec4 = make_record(4, 44)
+        native.write_bytes(baseline.HEADER + seed_rec1 + seed_rec3)
+        staged.write_bytes(baseline.HEADER + rec1_dup + rec2 + pr_rec4)
+        baseline.apply_pr()
+        self.assertEqual(self.output.read_text(), "restored=true\n")
+        self.assertEqual(native.read_bytes(), baseline.HEADER + seed_rec1 + seed_rec3 + rec2 + pr_rec4)
+
+        # stage-pr validates native_file() and copies it back to pr_file().
+        self.output.write_text("")
+        staged.unlink()
+        subprocess.run([sys.executable, "-I", script, "stage-pr"], check=True)
+        self.assertEqual(self.output.read_text(), f"file={staged}\n")
+        self.assertEqual(staged.read_bytes(), native.read_bytes())
+
+    def test_merge_vectors_respects_max_bytes_cap(self):
+        rec_a = make_record(1, 1)
+        rec_b = make_record(2, 2)
+        rec_c = make_record(3, 3)
+        rec_d = make_record(4, 4)
+        with patch.object(baseline, "MAX_BYTES", len(baseline.HEADER) + 3 * baseline.RECORD):
+            merged = baseline.merge_vectors(
+                baseline.HEADER + rec_a + rec_b,
+                baseline.HEADER + rec_a + rec_c + rec_d,
+            )
+        self.assertEqual(merged, baseline.HEADER + rec_a + rec_b + rec_c)
+
+    def test_pr_cache_rejects_corrupt_oversized_and_symlink_inputs_without_clobbering_seed(self):
+        native = baseline.native_file()
+        native.parent.mkdir(parents=True, exist_ok=True)
+        seed_bytes = baseline.HEADER + make_record(7, 7)
+        native.write_bytes(seed_bytes)
+        staged = baseline.pr_file()
+        staged.parent.mkdir(parents=True, exist_ok=True)
+
+        for bad in (b"", baseline.HEADER, DATA[:-1], b"BADMAGIC" + DATA[8:]):
+            staged.write_bytes(bad)
+            with self.assertRaises(ValueError):
+                baseline.apply_pr()
+            self.assertEqual(native.read_bytes(), seed_bytes)
+            self.assertEqual(self.output.read_text(), "")
+
+        with patch.object(baseline, "MAX_BYTES", len(baseline.HEADER) + baseline.RECORD):
+            staged.write_bytes(baseline.HEADER + make_record(1) + make_record(2))
+            with self.assertRaises(ValueError):
+                baseline.apply_pr()
+            self.assertEqual(native.read_bytes(), seed_bytes)
+
+        # Symlinked vectors.bin (pointing to valid file and dangling) must be rejected.
+        elsewhere = staged.parent.parent / "elsewhere.bin"
+        elsewhere.write_bytes(DATA)
+        staged.unlink()
+        staged.symlink_to(elsewhere)
+        with self.assertRaises(ValueError):
+            baseline.apply_pr()
+        elsewhere.unlink()
+        with self.assertRaises(ValueError):
+            baseline.apply_pr()
+        self.assertEqual(native.read_bytes(), seed_bytes)
+
+        # Symlinked parent directory must be rejected on both apply_pr and stage_pr.
+        staged.unlink()
+        staged.parent.rmdir()
+        real_dir = Path(os.environ["RUNNER_TEMP"]) / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "vectors.bin").write_bytes(DATA)
+        staged.parent.symlink_to(real_dir)
+        with self.assertRaises(ValueError):
+            baseline.apply_pr()
+        with self.assertRaises(ValueError):
+            baseline.stage_pr()
+        self.assertEqual(native.read_bytes(), seed_bytes)
 
 
 if __name__ == "__main__":
