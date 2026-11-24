@@ -23,6 +23,7 @@ jobs:
         working-directory: source
     env:
       BASE: ${{ github.event.pull_request.base.sha }}
+      SAME_REPO: ${{ github.event.pull_request.head.repo.id && github.event.pull_request.head.repo.id == github.event.repository.id && 'true' || 'false' }}
     outputs:
       structural: ${{ steps.structural.outputs.structural }}
       structure_state: ${{ steps.scan.outputs.structural }}
@@ -95,6 +96,23 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -I ../policy/.github/duplication/baseline.py restore
 
+      - name: Restore pull-request function vectors
+        if: github.event_name == 'pull_request' && steps.scan.outputs.eligibility == 'run'
+        id: pr_vectors
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/jscpd-pr-cache/vectors.bin
+          key: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-
+
+      - name: Apply pull-request function vectors
+        if: steps.pr_vectors.outputs.cache-matched-key != ''
+        id: apply_pr
+        continue-on-error: true
+        timeout-minutes: 2
+        run: python3 -I ../policy/.github/duplication/baseline.py apply-pr
+
       - name: Restore public model weights
         if: steps.scan.outputs.eligibility == 'run'
         id: weights
@@ -126,10 +144,27 @@ jobs:
         if: steps.model.outcome == 'success'
         id: semantic
         continue-on-error: true
-        timeout-minutes: ${{ steps.baseline.outputs.restored == 'true' && 12 || 2 }}
-        env:
-          VECTOR_BASELINE: ${{ steps.baseline.outputs.restored }}
+        timeout-minutes: ${{ (env.SAME_REPO == 'true' || steps.baseline.outputs.restored == 'true') && 12 || 2 }}
         run: python3 -I ../policy/.github/duplication/scan.py semantic
+
+      - name: Stage pull-request function vectors
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.semantic.outcome == 'success' &&
+          steps.semantic.outputs.embedded == 'true' &&
+          steps.pr_vectors.outputs.cache-hit != 'true'
+        id: stage_pr
+        continue-on-error: true
+        timeout-minutes: 2
+        run: python3 -I ../policy/.github/duplication/baseline.py stage-pr
+
+      - name: Save pull-request function vectors
+        if: steps.stage_pr.outputs.file != ''
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/jscpd-pr-cache/vectors.bin
+          key: ${{ steps.scan.outputs.family }}-vectors-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
 
   comment:
     needs: scan
