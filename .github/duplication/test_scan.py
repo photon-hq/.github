@@ -152,7 +152,10 @@ class ClassificationTest(unittest.TestCase):
 
     def test_semantic_main_preserves_prior_and_base_vectors_under_isolated_python(self):
         script = Path(__file__).with_name("scan.py").resolve()
-        rec = lambda b: bytes([b]) * 16 + bytes([b]) * (baseline.RECORD - 16)
+
+        def rec(byte_val):
+            return bytes([byte_val]) * 16 + bytes([byte_val]) * (baseline.RECORD - 16)
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "source"
             subprocess.run(["git", "init", "-q", root], check=True)
@@ -188,8 +191,8 @@ class ClassificationTest(unittest.TestCase):
             with patch.dict(os.environ, env):
                 native = baseline.native_file()
             native.parent.mkdir(parents=True, exist_ok=True)
-            # Prior PR cache holds rec(9); base scan writes only rec(1) (simulating jscpd pruning unseen hashes),
-            # and head scan sees rec(9) restored before running and writes only rec(2) + rec(9).
+            # Prior cache holds rec(9); base rewrite drops rec(9), head sees rec(9) restored and rewrites only rec(2),
+            # and final merge retains rec(2), rec(1), and rec(9).
             native.write_bytes(baseline.HEADER + rec(9))
 
             fake_jscpd = bin_dir / "jscpd"
@@ -206,15 +209,15 @@ class ClassificationTest(unittest.TestCase):
                 "    native.write_bytes(header + rec1)\n"
                 "    sys.stderr.write('Semantic clones (experimental): embedding 1 functions with nomic-ai/CodeRankEmbed on this machine\\n')\n"
                 "else:\n"
-                "    assert rec9 in native.read_bytes(), 'prior PR vector should survive base rewrite'\n"
-                "    native.write_bytes(header + rec2 + rec9)\n"
+                "    assert rec9 in native.read_bytes(), 'prior vector should survive base rewrite'\n"
+                "    native.write_bytes(header + rec2)\n"
                 "    sys.stderr.write('Semantic clones (experimental): embedding 1 of 2 functions with nomic-ai/CodeRankEmbed on this machine, the rest cached\\n')\n"
             )
             fake_jscpd.chmod(fake_jscpd.stat().st_mode | stat.S_IEXEC)
 
             Path(env["GITHUB_OUTPUT"]).write_text("")
             subprocess.run([sys.executable, "-I", script, "semantic"], cwd=root, env=env, check=True)
-            self.assertEqual(native.read_bytes(), baseline.HEADER + rec(2) + rec(9) + rec(1))
+            self.assertEqual(native.read_bytes(), baseline.HEADER + rec(2) + rec(1) + rec(9))
             output_lines = Path(env["GITHUB_OUTPUT"]).read_text().splitlines()
             self.assertIn("embedded=true", output_lines)
 

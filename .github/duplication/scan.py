@@ -184,7 +184,8 @@ def main(mode):
     if mode == "semantic":
         _, base_vectors = current_vectors()
         if vector_path and base_vectors and prior_vectors and base_vectors != prior_vectors:
-            baseline.write_atomic(vector_path, baseline.merge_vectors(base_vectors, prior_vectors))
+            base_vectors = baseline.merge_vectors(base_vectors, prior_vectors)
+            baseline.write_atomic(vector_path, base_vectors)
         # jscpd keys vectors by canonical scan path. Switch revisions at one stable path.
         git("checkout", "--quiet", "--detach", head, cwd=tree)
     after = detect(mode, tool, tree if mode == "semantic" else source, "head", args)
