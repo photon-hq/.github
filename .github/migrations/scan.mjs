@@ -45,8 +45,7 @@ export function collectChangedSqlEntries(repoDir, baseSha, headSha) {
       baseSha,
       headSha,
       '--',
-      '*.sql',
-      '*.SQL',
+      ':(icase)*.sql',
     ],
     repoDir,
   ).toString('utf8');
@@ -91,7 +90,25 @@ function sliceLineUtf8Bytes(lineText, startByte, endByte = null) {
   return buf.subarray(s, e).toString('utf8');
 }
 
-export function extractStatementSignature(fileLines, row) {
+function buildFileStatementIndex(fileLines) {
+  const fileText = fileLines.join('\n');
+  const lineStartOffsets = new Array(fileLines.length);
+  let cursor = 0;
+  for (let idx = 0; idx < fileLines.length; idx++) {
+    lineStartOffsets[idx] = cursor;
+    cursor += fileLines[idx].length + 1;
+  }
+  const breakOffsets = [0];
+  scanSqlTokens(fileText, {
+    keepQuotes: true,
+    onStatementBreak: (nextIdx) => {
+      breakOffsets.push(nextIdx);
+    },
+  });
+  return { fileText, lineStartOffsets, breakOffsets };
+}
+
+export function extractStatementSignature(fileLines, row, prebuiltIndex = null) {
   if (!Array.isArray(fileLines) || fileLines.length === 0) {
     return String(row.message ?? '');
   }
@@ -116,24 +133,28 @@ export function extractStatementSignature(fileLines, row) {
   }
   const normalizedSpan = stripSqlCommentsAndCollapseWhitespace(spanParts.join('\n'));
 
-  // Capture statement head preceding the span (after the last top-level `;` or `--> statement-breakpoint`),
-  // ignoring semicolons inside SQL comments or quoted strings/identifiers.
-  const lookbackMin = startLine > 5000 ? startLine - 5000 : 0;
-  const prefixParts = [];
-  for (let ln = lookbackMin; ln < startLine; ln++) {
-    prefixParts.push(fileLines[ln]);
-  }
-  prefixParts.push(sliceLineUtf8Bytes(fileLines[startLine], 0, startCol));
-  const prefixText = prefixParts.join('\n');
+  // Resolve statement start from precomputed file-wide top-level boundaries (`;` and `--> statement-breakpoint`).
+  const { fileText, lineStartOffsets, breakOffsets } =
+    prebuiltIndex ?? buildFileStatementIndex(fileLines);
+  const spanCharStart =
+    lineStartOffsets[startLine] + sliceLineUtf8Bytes(fileLines[startLine], 0, startCol).length;
 
+  let lo = 0;
+  let hi = breakOffsets.length - 1;
   let stmtStart = 0;
-  scanSqlTokens(prefixText, {
-    keepQuotes: true,
-    onStatementBreak: (nextIdx) => {
-      stmtStart = nextIdx;
-    },
-  });
-  const normalizedPrefix = stripSqlCommentsAndCollapseWhitespace(prefixText.slice(stmtStart));
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (breakOffsets[mid] <= spanCharStart) {
+      stmtStart = breakOffsets[mid];
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  const normalizedPrefix = stripSqlCommentsAndCollapseWhitespace(
+    fileText.slice(stmtStart, spanCharStart),
+  );
   return normalizedPrefix ? `${normalizedPrefix} :: ${normalizedSpan}` : normalizedSpan;
 }
 
@@ -225,17 +246,19 @@ export function runSquawkScan({
   }
 
   const allowedSet = new Set(verifiedFiles);
-  const linesByFile = new Map();
-  const getFileLines = (relFile) => {
-    if (linesByFile.has(relFile)) return linesByFile.get(relFile);
+  const parsedByFile = new Map();
+  const getFileEntry = (relFile) => {
+    if (parsedByFile.has(relFile)) return parsedByFile.get(relFile);
     let lines = [];
     try {
-      lines = readFileSync(path.join(targetDir, relFile), 'utf8').split(/\r?\n/);
+      const raw = readFileSync(path.join(targetDir, relFile), 'utf8').replace(/^\ufeff/, '');
+      lines = raw.split(/\r?\n/);
     } catch {
       lines = [];
     }
-    linesByFile.set(relFile, lines);
-    return lines;
+    const entry = { lines, index: lines.length > 0 ? buildFileStatementIndex(lines) : null };
+    parsedByFile.set(relFile, entry);
+    return entry;
   };
 
   const findings = [];
@@ -259,8 +282,11 @@ export function runSquawkScan({
     const message = typeof row.message === 'string' ? row.message : '';
     const help = typeof row.help === 'string' ? row.help : '';
     const note = typeof row.note === 'string' ? row.note : '';
+    const fileEntry = rule === 'syntax-error' ? null : getFileEntry(file);
     const statementKey =
-      rule === 'syntax-error' ? message : extractStatementSignature(getFileLines(file), row);
+      rule === 'syntax-error'
+        ? message
+        : extractStatementSignature(fileEntry.lines, row, fileEntry.index);
 
     findings.push({
       file,

@@ -52,7 +52,7 @@ jobs:
             echo 'state=unavailable' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --find-renames --name-only --diff-filter=ACMRT -z "$merge_base" HEAD -- '*.sql' '*.SQL' > "$RUNNER_TEMP/sql-files"
+          git diff --find-renames --name-only --diff-filter=ACMRT -z "$merge_base" HEAD -- ':(icase)*.sql' > "$RUNNER_TEMP/sql-files"
           if [ -s "$RUNNER_TEMP/sql-files" ]; then
             echo 'scope=sql' >> "$GITHUB_OUTPUT"
           else
@@ -90,11 +90,11 @@ jobs:
         timeout-minutes: 5
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          LABELS: ${{ steps.pr_labels.outputs.labels || toJSON(github.event.pull_request.labels.*.name) }}
+          LABELS: ${{ steps.pr_labels.outputs.labels }}
           SCOPE_STATE: ${{ steps.scope.outputs.scope }}
           IMPL_OUTCOME: ${{ steps.implementation.outcome }}
         run: |
-          if [ "$SCOPE_STATE" != 'sql' ] || [ "$IMPL_OUTCOME" != 'success' ] || [ ! -d source ]; then
+          if [ "$SCOPE_STATE" != 'sql' ] || [ "$IMPL_OUTCOME" != 'success' ] || [ -z "$LABELS" ] || [ ! -d source ]; then
             echo 'state=unavailable' >> "$GITHUB_OUTPUT"
             exit 0
           fi

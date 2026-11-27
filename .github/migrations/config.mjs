@@ -48,7 +48,7 @@ const NON_MIGRATION_DIRS = new Set([
 ]);
 
 const DEDICATED_MIGRATION_DIR_RE =
-  /^(?:drizzle(?:-[a-z0-9_]+)?|migrations?|migrate|[a-z0-9_]+[-_]migrations?)$/i;
+  /^(?:drizzle(?:-[a-z0-9_-]+)?|migrations?|migrate|[a-z0-9][a-z0-9_-]*[-_]migrations?)$/i;
 const GENERIC_SQL_DIR_RE = /^(?:sql|db)$/i;
 const NON_PG_SEGMENT_RE =
   /(?:clickhouse|^\.signoz$|^(?:mysql|mariadb|vitess|tidb|sqlite3?|libsql|turso|d1|bigquery|snowflake|duckdb)$|(?:^|[-_])(?:mysql|mariadb|sqlite3?|libsql)(?:$|[-_]))/i;
@@ -94,7 +94,7 @@ const MYSQL_SQL_RE =
   /\b(?:ENGINE\s*=\s*(?:InnoDB|MyISAM|NDB)\b|AUTO_INCREMENT\b|DEFAULT\s+CHARSET\s*=)/i;
 const SQLITE_SQL_RE =
   /\b(?:AUTOINCREMENT\b|PRAGMA\s+(?:foreign_keys|journal_mode|synchronous|table_info|user_version)\b|WITHOUT\s+ROWID\b)/i;
-const DIALECT_HEADER_RE = /^\s*--\s*(?:squawk-)?dialect\s*:\s*([a-z0-9_-]+)/im;
+const DIALECT_LINE_COMMENT_RE = /^\s*(?:squawk-)?dialect\s*:\s*([a-z0-9_-]+)/i;
 
 const RULE_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const PG_VERSION_RE = /^\d+(?:\.\d+)*$/;
@@ -206,10 +206,29 @@ function tokenizeToml(source) {
       i += 3;
       if (src[i] === '\r' && src[i + 1] === '\n') i += 2;
       else if (src[i] === '\n') i++;
-      const end = src.indexOf(delim, i);
-      if (end < 0) return null;
-      const raw = src.slice(i, end);
-      i = end + 3;
+      let raw = '';
+      let closed = false;
+      while (i < src.length) {
+        if (isBasic && src[i] === '\\') {
+          if (i + 1 >= src.length) return null;
+          raw += src.slice(i, i + 2);
+          i += 2;
+          continue;
+        }
+        if (src.startsWith(delim, i)) {
+          i += 3;
+          let extraQuotes = 0;
+          while (extraQuotes < 2 && src[i] === delim[0]) {
+            raw += delim[0];
+            i++;
+            extraQuotes++;
+          }
+          closed = true;
+          break;
+        }
+        raw += src[i++];
+      }
+      if (!closed) return null;
       tokens.push({ type: 'string', value: isBasic ? unescapeTomlBasicString(raw, true) : raw });
       continue;
     }
@@ -519,15 +538,15 @@ export function scanSqlTokens(sql, { keepQuotes = true, onStatementBreak = null 
       pushSpace();
       continue;
     }
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      const prev = i > 0 ? sql[i - 1] : '';
-      const prev2 = i > 1 ? sql[i - 2] : '';
-      const cEscape =
-        quote === "'" &&
-        (prev === 'E' || prev === 'e') &&
-        (i === 1 || !/[A-Za-z0-9_$]/.test(prev2));
-      const tokenStart = i++;
+    if (
+      ch === "'" ||
+      ch === '"' ||
+      ((ch === 'E' || ch === 'e') && sql[i + 1] === "'")
+    ) {
+      const cEscape = (ch === 'E' || ch === 'e') && sql[i + 1] === "'";
+      const tokenStart = i;
+      if (cEscape) i++;
+      const quote = sql[i++];
       while (i < sql.length) {
         const c = sql[i++];
         if (cEscape && c === '\\' && i < sql.length) {
@@ -544,6 +563,13 @@ export function scanSqlTokens(sql, { keepQuotes = true, onStatementBreak = null 
       }
       if (keepQuotes) out += sql.slice(tokenStart, i);
       else pushSpace();
+      continue;
+    }
+    if (/[A-Za-z_\x80-\uffff]/.test(ch)) {
+      let end = i + 1;
+      while (end < sql.length && /[A-Za-z0-9_$\x80-\uffff]/.test(sql[end])) end++;
+      out += sql.slice(i, end);
+      i = end;
       continue;
     }
     if (ch === '$') {
@@ -572,34 +598,32 @@ export function scanSqlTokens(sql, { keepQuotes = true, onStatementBreak = null 
   return out.trim();
 }
 
-export function isNonTransactionalMigrationFile(relFilePath, sqlSample = '') {
-  const cleanRel = normalizeGitRelPath(relFilePath);
-  if (NON_TRANSACTIONAL_FILENAME_RE.test(path.posix.basename(cleanRel))) {
-    return true;
-  }
-  if (typeof sqlSample !== 'string' || !sqlSample) return false;
-  let i = sqlSample.startsWith('\ufeff') ? 1 : 0;
-  while (i < sqlSample.length) {
-    const ch = sqlSample[i];
+function scanLeadingSqlComments(sqlText, onLineComment) {
+  if (typeof sqlText !== 'string' || !sqlText) return 0;
+  let i = sqlText.startsWith('\ufeff') ? 1 : 0;
+  while (i < sqlText.length) {
+    const ch = sqlText[i];
     if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
       i++;
       continue;
     }
-    if (ch === '-' && sqlSample[i + 1] === '-') {
+    if (ch === '-' && sqlText[i + 1] === '-') {
       let end = i + 2;
-      while (end < sqlSample.length && sqlSample[end] !== '\n' && sqlSample[end] !== '\r') end++;
-      if (NON_TRANSACTIONAL_HEADER_RE.test(sqlSample.slice(i + 2, end))) return true;
+      while (end < sqlText.length && sqlText[end] !== '\n' && sqlText[end] !== '\r') end++;
+      if (onLineComment && onLineComment(sqlText.slice(i + 2, end)) === true) {
+        return i;
+      }
       i = end;
       continue;
     }
-    if (ch === '/' && sqlSample[i + 1] === '*') {
+    if (ch === '/' && sqlText[i + 1] === '*') {
       i += 2;
       let depth = 1;
-      while (i < sqlSample.length && depth > 0) {
-        if (sqlSample[i] === '/' && sqlSample[i + 1] === '*') {
+      while (i < sqlText.length && depth > 0) {
+        if (sqlText[i] === '/' && sqlText[i + 1] === '*') {
           depth++;
           i += 2;
-        } else if (sqlSample[i] === '*' && sqlSample[i + 1] === '/') {
+        } else if (sqlText[i] === '*' && sqlText[i + 1] === '/') {
           depth--;
           i += 2;
         } else {
@@ -610,7 +634,23 @@ export function isNonTransactionalMigrationFile(relFilePath, sqlSample = '') {
     }
     break;
   }
-  return false;
+  return i;
+}
+
+export function isNonTransactionalMigrationFile(relFilePath, sqlText = '') {
+  const cleanRel = normalizeGitRelPath(relFilePath);
+  if (NON_TRANSACTIONAL_FILENAME_RE.test(path.posix.basename(cleanRel))) {
+    return true;
+  }
+  let matched = false;
+  scanLeadingSqlComments(sqlText, (commentBody) => {
+    if (NON_TRANSACTIONAL_HEADER_RE.test(commentBody)) {
+      matched = true;
+      return true;
+    }
+    return false;
+  });
+  return matched;
 }
 
 function computeExcludedRules(assumeInTransaction, explicitExcludedRules, includedRules) {
@@ -622,39 +662,39 @@ function computeExcludedRules(assumeInTransaction, explicitExcludedRules, includ
   return baseExcluded.filter((r) => !includedSet.has(r));
 }
 
-function readSqlSampleIfRegular(repoDir, relFilePath, realRepoRoot) {
+function readSqlTextIfRegular(repoDir, relFilePath, realRepoRoot) {
   const absPath = path.join(repoDir, relFilePath);
   if (!isRegularRepoFile(absPath, realRepoRoot)) return null;
   try {
-    return readFileSync(absPath).subarray(0, 16 * 1024).toString('utf8');
+    return readFileSync(absPath, 'utf8');
   } catch {
     return null;
   }
 }
 
-export function resolveSquawkProfile(repoDir, rawRelFilePath, existingCache = null, sqlSample = null) {
-  const cache = existingCache ?? createClassifierCache(repoDir);
-  const relFilePath = normalizeGitRelPath(rawRelFilePath);
-  let foundDir = null;
-  let parsed = null;
-
+function findNearestToml(cache, relFilePath) {
   for (const dir of getAncestorDirs(relFilePath)) {
     const candidate = readTomlAtDir(cache, dir);
     if (candidate !== null) {
-      foundDir = dir;
-      parsed = candidate;
-      break;
+      return { foundDir: dir, parsed: candidate };
     }
   }
+  return { foundDir: null, parsed: null };
+}
+
+export function resolveSquawkProfile(repoDir, rawRelFilePath, existingCache = null, sqlText = null) {
+  const cache = existingCache ?? createClassifierCache(repoDir);
+  const relFilePath = normalizeGitRelPath(rawRelFilePath);
+  const { foundDir, parsed } = findNearestToml(cache, relFilePath);
 
   const pgVersion = parsed?.pg_version ?? DEFAULT_PG_VERSION;
   const explicitAssumeInTransaction = parsed?.assume_in_transaction !== undefined;
-  const sample =
-    !explicitAssumeInTransaction && sqlSample === null
-      ? (readSqlSampleIfRegular(repoDir, relFilePath, cache.realRepoRoot) ?? '')
-      : (sqlSample ?? '');
+  const content =
+    !explicitAssumeInTransaction && sqlText === null
+      ? (readSqlTextIfRegular(repoDir, relFilePath, cache.realRepoRoot) ?? '')
+      : (sqlText ?? '');
   const nonTransactionalMarker =
-    !explicitAssumeInTransaction && isNonTransactionalMigrationFile(relFilePath, sample);
+    !explicitAssumeInTransaction && isNonTransactionalMigrationFile(relFilePath, content);
   const assumeInTransaction = explicitAssumeInTransaction
     ? parsed.assume_in_transaction
     : !nonTransactionalMarker;
@@ -697,8 +737,8 @@ export function resolveBaseFileProfile(baseRepoDir, rawBaseRelPath, headProfile,
   if (headProfile.explicitAssumeInTransaction) {
     return { ...headProfile, excludedPaths: [] };
   }
-  const sample = readSqlSampleIfRegular(baseRepoDir, baseRelPath, baseCache.realRepoRoot) ?? '';
-  const assumeInTransaction = !isNonTransactionalMigrationFile(baseRelPath, sample);
+  const content = readSqlTextIfRegular(baseRepoDir, baseRelPath, baseCache.realRepoRoot) ?? '';
+  const assumeInTransaction = !isNonTransactionalMigrationFile(baseRelPath, content);
   return {
     ...headProfile,
     assumeInTransaction,
@@ -866,15 +906,26 @@ function hasPostgresPrismaSchema(cache, relDir) {
   return result;
 }
 
-function detectNonPostgresSqlContent(sqlSample) {
-  const headerMatch = sqlSample.match(DIALECT_HEADER_RE);
-  if (headerMatch) {
-    const declared = headerMatch[1].toLowerCase();
-    if (declared !== 'postgres' && declared !== 'postgresql' && declared !== 'pg') {
+function detectNonPostgresSqlContent(sqlText) {
+  let declaredDialect = null;
+  const firstStmtIdx = scanLeadingSqlComments(sqlText, (commentBody) => {
+    const match = commentBody.match(DIALECT_LINE_COMMENT_RE);
+    if (match) {
+      declaredDialect = match[1].toLowerCase();
       return true;
     }
+    return false;
+  });
+  if (
+    declaredDialect &&
+    declaredDialect !== 'postgres' &&
+    declaredDialect !== 'postgresql' &&
+    declaredDialect !== 'pg'
+  ) {
+    return true;
   }
-  const unquoted = scanSqlTokens(sqlSample, { keepQuotes: false });
+  const statementSample = sqlText.slice(firstStmtIdx, firstStmtIdx + 16 * 1024);
+  const unquoted = scanSqlTokens(statementSample, { keepQuotes: false });
   return (
     CLICKHOUSE_SQL_RE.test(unquoted) ||
     MYSQL_SQL_RE.test(unquoted) ||
@@ -882,7 +933,7 @@ function detectNonPostgresSqlContent(sqlSample) {
   );
 }
 
-function checkCandidateSqlPreconditions(relPath, parts, tomlRelDir, sqlSample) {
+function checkCandidateSqlPreconditions(relPath, parts, tomlRelDir, sqlText) {
   const dirSegments = parts.slice(0, -1);
   const fileName = parts[parts.length - 1];
 
@@ -912,7 +963,7 @@ function checkCandidateSqlPreconditions(relPath, parts, tomlRelDir, sqlSample) {
     return 'test-or-fixture';
   }
 
-  if (detectNonPostgresSqlContent(sqlSample)) {
+  if (detectNonPostgresSqlContent(sqlText)) {
     return 'non-postgres-sql';
   }
 
@@ -928,25 +979,27 @@ function readVerifiedSqlCandidate(repoDir, rawRelPath, cache) {
     relPath.startsWith('/') ||
     parts.some((p) => !p || p === '.' || p === '..' || ALWAYS_SKIP_DIRS.has(p))
   ) {
-    return { ok: false, reason: 'ignored-path', relPath, parts, sqlSample: null };
+    return { ok: false, reason: 'ignored-path', relPath, parts, sqlText: null };
   }
-  const sqlSample = readSqlSampleIfRegular(repoDir, relPath, cache.realRepoRoot);
-  if (sqlSample === null) {
-    return { ok: false, reason: 'missing-or-irregular', relPath, parts, sqlSample: null };
+  const sqlText = readSqlTextIfRegular(repoDir, relPath, cache.realRepoRoot);
+  if (sqlText === null) {
+    return { ok: false, reason: 'missing-or-irregular', relPath, parts, sqlText: null };
   }
-  return { ok: true, reason: null, relPath, parts, sqlSample };
+  return { ok: true, reason: null, relPath, parts, sqlText };
 }
 
 export function canCompareAsBaseMigrationSql(repoDir, rawRelPath, headProfile, existingCache = null) {
   const cache = existingCache ?? createClassifierCache(repoDir);
   const candidate = readVerifiedSqlCandidate(repoDir, rawRelPath, cache);
   if (!candidate.ok) return false;
+  const baseTomlRelDir =
+    findNearestToml(cache, candidate.relPath).foundDir ?? headProfile?.tomlRelDir ?? null;
   return (
     checkCandidateSqlPreconditions(
       candidate.relPath,
       candidate.parts,
-      headProfile?.tomlRelDir ?? null,
-      candidate.sqlSample,
+      baseTomlRelDir,
+      candidate.sqlText,
     ) === null
   );
 }
@@ -957,14 +1010,14 @@ export function classifySqlFile(repoDir, rawRelPath, existingCache = null) {
   if (!candidate.ok) {
     return { include: false, reason: candidate.reason, profile: null };
   }
-  const { relPath, parts, sqlSample } = candidate;
+  const { relPath, parts, sqlText } = candidate;
 
-  const profile = resolveSquawkProfile(repoDir, relPath, cache, sqlSample);
+  const profile = resolveSquawkProfile(repoDir, relPath, cache, sqlText);
   if (profile.excludedPaths.some((pat) => matchesExcludedPath(relPath, pat))) {
     return { include: false, reason: 'excluded-path', profile };
   }
 
-  const rejection = checkCandidateSqlPreconditions(relPath, parts, profile.tomlRelDir, sqlSample);
+  const rejection = checkCandidateSqlPreconditions(relPath, parts, profile.tomlRelDir, sqlText);
   if (rejection) {
     return { include: false, reason: rejection, profile };
   }

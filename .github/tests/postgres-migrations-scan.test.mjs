@@ -763,3 +763,85 @@ test('handles TOML whitespace/continuations, quoted SQL identifiers, comment sem
   }
 });
 
+test('handles escaped multiline TOML quotes, embedded $ identifiers, >16KiB headers, BOM offsets, icase .Sql, and opted-in dir renames', () => {
+  const squawkDir = ensureSquawkInstall();
+
+  // Escaped quotes inside `"""..."""` do not prematurely close the multiline string.
+  assert.deepEqual(
+    parseSquawkToml('note = """a \\""" b"""\nassume_in_transaction = false'),
+    { assume_in_transaction: false },
+  );
+
+  // Embedded `$` inside an SQL identifier does not open an unclosed dollar quote.
+  const embeddedDollarBase = [
+    'SELECT 1 AS foo$tag$;',
+    'ALTER TABLE "accounts" DROP COLUMN "legacy";',
+  ];
+  const embeddedDollarCommented = [
+    'SELECT 1 AS foo$tag$;',
+    '-- added context comment',
+    'ALTER TABLE "accounts" DROP COLUMN "legacy";',
+  ];
+  assert.equal(
+    extractStatementSignature(embeddedDollarCommented, {
+      line: 2,
+      line_end: 2,
+      column: 23,
+      column_end: 43,
+    }),
+    extractStatementSignature(embeddedDollarBase, {
+      line: 1,
+      line_end: 1,
+      column: 23,
+      column_end: 43,
+    }),
+  );
+
+  // >16 KiB leading license comment before `-- migrate:no-transaction` still triggers non-transactional mode.
+  const longComment = `-- ${'x'.repeat(18 * 1024)}\n-- migrate:no-transaction\nCREATE INDEX CONCURRENTLY idx ON t (c);`;
+  assert.equal(isNonTransactionalMigrationFile('migrations/01.sql', longComment), true);
+
+  const { dir, baseSha } = createRepoWithCommit({
+    'package.json': JSON.stringify({ name: 'svc2', dependencies: { pg: '^8.12.0' } }),
+    'migrations/0001_bom.sql': 'ALTER TABLE "accounts" DROP COLUMN "legacy_bom";',
+    'tests/.squawk.toml': 'pg_version = "17.0"',
+    'tests/old/0001_optin.sql': 'ALTER TABLE "accounts" DROP COLUMN "legacy_optin";',
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-followup-'));
+
+  try {
+    rmSync(path.join(dir, 'tests/old/0001_optin.sql'));
+    populateFiles(dir, {
+      // Prepend UTF-8 BOM to existing first-line DROP COLUMN -> must remain 0 added findings.
+      'migrations/0001_bom.sql': '\ufeffALTER TABLE "accounts" DROP COLUMN "legacy_bom";',
+      // Rename from `tests/old` (with `tests/.squawk.toml`) to `fixtures/new` (with `fixtures/.squawk.toml`) -> 0 added findings.
+      'fixtures/.squawk.toml': 'pg_version = "17.0"',
+      'fixtures/new/0001_optin.sql': 'ALTER TABLE "accounts" DROP COLUMN "legacy_optin";',
+      // Mixed-case `.Sql` in compound hyphenated `customer-billing-migrations` with `-- dialect: sqlite` inside dollar-quoted body -> scanned and flagged!
+      'customer-billing-migrations/0002_func.Sql': [
+        'CREATE OR REPLACE FUNCTION demo() RETURNS text LANGUAGE sql AS $fn$',
+        '-- dialect: sqlite',
+        "SELECT 'ok'::text;",
+        '$fn$;',
+        'ALTER TABLE "accounts" DROP COLUMN "newly_dropped";',
+      ].join('\n'),
+    });
+    commitAll(dir, 'test bom, opt-in dir rename, compound dir, and dollar-quoted dialect line');
+
+    const res = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.report.checkedFiles, 3);
+    assert.equal(res.report.addedCount, 1);
+    assert.equal(res.report.added[0].file, 'customer-billing-migrations/0002_func.Sql');
+    assert.equal(res.report.added[0].rule, 'ban-drop-column');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
