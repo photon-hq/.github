@@ -1,0 +1,303 @@
+name: Check PostgreSQL migrations
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+  workflow_call:
+
+permissions: {}
+
+env:
+  SQUAWK_VERSION: '2.74.0'
+
+jobs:
+  scan:
+    runs-on: ${{ github.event.pull_request.head.repo.id && github.event.pull_request.head.repo.id == github.event.repository.id && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      scope: ${{ steps.scan.outputs.scope || steps.scope.outputs.scope || steps.merge_group.outputs.scope }}
+      state: ${{ steps.scan.outputs.state || steps.scope.outputs.state || steps.merge_group.outputs.state }}
+      report: ${{ steps.scan.outputs.report }}
+    steps:
+      - name: Pass on merge queue (already checked on pull request)
+        if: github.event_name == 'merge_group'
+        id: merge_group
+        run: |
+          echo 'scope=skip' >> "$GITHUB_OUTPUT"
+          echo 'state=clean' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: github.event_name == 'pull_request'
+        id: checkout
+        continue-on-error: true
+        with:
+          path: source
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect changed SQL files
+        if: steps.checkout.outcome == 'success'
+        id: scope
+        continue-on-error: true
+        working-directory: source
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$BASE" ] || ! merge_base="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
+            echo 'scope=unavailable' >> "$GITHUB_OUTPUT"
+            echo 'state=unavailable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --find-renames --name-only --diff-filter=ACMR -z "$merge_base" HEAD -- '*.sql' '*.SQL' > "$RUNNER_TEMP/sql-files"
+          if [ -s "$RUNNER_TEMP/sql-files" ]; then
+            echo 'scope=sql' >> "$GITHUB_OUTPUT"
+          else
+            echo 'scope=skip' >> "$GITHUB_OUTPUT"
+            echo 'state=clean' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the implementation at the workflow revision
+        if: steps.scope.outputs.scope == 'sql' && job.workflow_sha != ''
+        id: implementation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        continue-on-error: true
+        with:
+          repository: photon-hq/.github
+          ref: ${{ job.workflow_sha }}
+          path: policy
+          sparse-checkout: .github/migrations
+          persist-credentials: false
+
+      - name: Resolve live pull request labels
+        if: github.event_name == 'pull_request' && steps.scope.outputs.scope == 'sql'
+        id: pr_labels
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$PR_NUMBER" ] && live_labels="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '[.labels[].name] | tojson' 2>/dev/null)"; then
+            echo "labels=$live_labels" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check PostgreSQL migrations
+        if: github.event_name == 'pull_request' && steps.scope.outputs.scope != 'skip'
+        id: scan
+        timeout-minutes: 5
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LABELS: ${{ steps.pr_labels.outputs.labels || toJSON(github.event.pull_request.labels.*.name) }}
+          SCOPE_STATE: ${{ steps.scope.outputs.scope }}
+          IMPL_OUTCOME: ${{ steps.implementation.outcome }}
+        run: |
+          if [ "$SCOPE_STATE" != 'sql' ] || [ "$IMPL_OUTCOME" != 'success' ] || [ ! -d source ]; then
+            echo 'state=unavailable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tool="$RUNNER_TEMP/squawk"
+          mkdir -p "$tool"
+          if ! (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save "squawk-cli@$SQUAWK_VERSION"); then
+            echo 'state=unavailable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cd source
+          node ../policy/.github/migrations/scan.mjs
+
+  comment:
+    needs: scan
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: check-postgres-migrations-comment-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      queue: max
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Publish the report
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          SCOPE: ${{ needs.scan.outputs.scope }}
+          STATE: ${{ needs.scan.outputs.state }}
+          REPORT: ${{ needs.scan.outputs.report }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+            const target = { ...context.repo, issue_number: pr.number };
+            const marker = '<!-- photon-squawk -->';
+            const head = pr.head?.sha;
+            const baseRef = pr.base?.ref;
+            const baseSha = pr.base?.sha;
+            const fetchLivePr = async () => {
+              const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
+              const hasLiveLabels = Array.isArray(current.labels);
+              const liveWaived = hasLiveLabels && current.labels.some(l => l?.name === 'allow-unsafe-migration');
+              const ok =
+                current.state === 'open' &&
+                Boolean(head) &&
+                current.head?.sha === head &&
+                Boolean(baseRef) &&
+                current.base?.ref === baseRef &&
+                Boolean(baseSha) &&
+                current.base?.sha === baseSha;
+              return { ok, hasLiveLabels, liveWaived };
+            };
+            const initialLive = await fetchLivePr();
+            if (!initialLive.ok) return;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
+            const matching = comments.filter(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            const [existing, ...duplicates] = matching;
+            const removeStaleComments = async () => {
+              if (!matching.length) return;
+              const live = await fetchLivePr();
+              if (!live.ok) return;
+              for (const item of matching) {
+                await github.rest.issues.deleteComment({ ...context.repo, comment_id: item.id });
+              }
+            };
+            if (
+              process.env.SCOPE === 'skip' ||
+              process.env.STATE === 'clean' ||
+              process.env.STATE === 'unavailable' ||
+              !process.env.REPORT
+            ) {
+              await removeStaleComments();
+              return;
+            }
+            const parsed = JSON.parse(process.env.REPORT);
+            const {
+              base,
+              checkedFiles,
+              beforeCount,
+              afterCount,
+              addedCount,
+              resolvedCount,
+              waived,
+              added,
+            } = parsed;
+            const isNonNegInt = n => Number.isSafeInteger(n) && n >= 0;
+            const isSafeFile = f =>
+              typeof f === 'string' &&
+              f.length > 0 &&
+              !f.startsWith('/') &&
+              f.split('/').every(seg => seg && seg !== '.' && seg !== '..');
+            const isRuleSlug = r => typeof r === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(r);
+            if (
+              !/^[0-9a-f]{40}$/.test(base) ||
+              !Number.isSafeInteger(checkedFiles) ||
+              checkedFiles < 1 ||
+              !isNonNegInt(beforeCount) ||
+              !isNonNegInt(afterCount) ||
+              !isNonNegInt(addedCount) ||
+              !isNonNegInt(resolvedCount) ||
+              typeof waived !== 'boolean' ||
+              !Array.isArray(added) ||
+              added.length !== Math.min(addedCount, 50) ||
+              !added.every(
+                r =>
+                  r &&
+                  isSafeFile(r.file) &&
+                  Number.isSafeInteger(r.line) &&
+                  r.line > 0 &&
+                  isRuleSlug(r.rule) &&
+                  typeof r.message === 'string' &&
+                  typeof r.help === 'string' &&
+                  typeof r.note === 'string',
+              )
+            ) {
+              throw new Error('Invalid PostgreSQL migration report');
+            }
+            if (addedCount === 0) {
+              await removeStaleComments();
+              return;
+            }
+
+            const escapeHtml = s =>
+              String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, c =>
+                  encodeURIComponent(c),
+                );
+            const blobLink = (file, line) => {
+              const encoded = file
+                .split('/')
+                .map(seg =>
+                  encodeURIComponent(seg).replace(
+                    /[!'()*]/g,
+                    c => '%' + c.charCodeAt(0).toString(16),
+                  ),
+                )
+                .join('/');
+              const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/${head}/${encoded}#L${line}`;
+              return `<a href="${url}"><code>${escapeHtml(file)}:${line}</code></a>`;
+            };
+            const ruleLink = rule => {
+              const href =
+                rule === 'syntax-error'
+                  ? 'https://squawkhq.com/docs/rules'
+                  : `https://squawkhq.com/docs/${encodeURIComponent(rule)}`;
+              return `<a href="${href}"><code>${escapeHtml(rule)}</code></a>`;
+            };
+
+            const issueNoun = addedCount === 1 ? 'violation' : 'violations';
+            const fileNoun = checkedFiles === 1 ? 'migration file' : 'migration files';
+            const resolvedSuffix = resolvedCount ? ` · resolved ${resolvedCount} pre-existing` : '';
+            let content = waived
+              ? `**${addedCount} new unsafe PostgreSQL migration ${issueNoun}** across ${checkedFiles} ${fileNoun} (waived via \`allow-unsafe-migration\` label)${resolvedSuffix}.`
+              : `**${addedCount} new unsafe PostgreSQL migration ${issueNoun}** across ${checkedFiles} ${fileNoun}${resolvedSuffix}. Rewrite using an expand-and-contract migration, suppress an intentional statement with \`-- squawk-ignore <rule>\` (directly above the statement, after any \`--> statement-breakpoint\`), or apply the \`allow-unsafe-migration\` PR label.`;
+
+            const bullets = [];
+            let remainingBudget = 62000 - content.length;
+            for (const { file, line, rule, message, help, note } of added) {
+              const impact = note
+                ? `${escapeHtml(message)} (${escapeHtml(note)})`
+                : escapeHtml(message);
+              const fixHint = help ? ` — <em>Fix:</em> ${escapeHtml(help)}` : '';
+              const waiveHint =
+                rule === 'syntax-error'
+                  ? ''
+                  : ` · waive inline with <code>-- squawk-ignore ${escapeHtml(rule)}</code>`;
+              const row = `- ${blobLink(file, line)} · ${ruleLink(rule)}: ${impact}${fixHint}${waiveHint}`;
+              if (row.length > remainingBudget) break;
+              bullets.push(row);
+              remainingBudget -= row.length + 1;
+            }
+            if (bullets.length > 0) {
+              content += '\n\n' + bullets.slice(0, 10).join('\n');
+            }
+            if (addedCount > 10 && bullets.length > 10) {
+              content += `\n\n<details><summary>${bullets.length - 10} more shown</summary>\n\n${bullets.slice(10).join('\n')}\n\n</details>`;
+            }
+            if (bullets.length < addedCount) {
+              content += `\n\nShowing ${bullets.length} of ${addedCount} findings.`;
+            }
+
+            const body = `${marker}\n### PostgreSQL migration check\n\n${content}`;
+            const finalLive = await fetchLivePr();
+            if (
+              !finalLive.ok ||
+              (addedCount > 0 && finalLive.hasLiveLabels && waived !== finalLive.liveWaived)
+            ) {
+              return;
+            }
+            for (const dup of duplicates) {
+              await github.rest.issues.deleteComment({ ...context.repo, comment_id: dup.id });
+            }
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({ ...target, body });
+            }

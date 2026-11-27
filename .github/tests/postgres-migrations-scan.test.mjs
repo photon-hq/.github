@@ -1,0 +1,565 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import {
+  CONCURRENT_INDEX_RULES,
+  classifySqlFile,
+  createClassifierCache,
+  DEFAULT_EXCLUDED_RULES,
+  DEFAULT_PG_VERSION,
+  isRealPathInsideRepo,
+  matchesExcludedPath,
+  parseSquawkToml,
+  resolveSquawkProfile,
+  serializeSquawkToml,
+} from '../migrations/config.mjs';
+import {
+  collectChangedSqlEntries,
+  diffMigrationFindings,
+  executePrCheck,
+  extractStatementSignature,
+  formatMigrationStepSummary,
+  hasAllowUnsafeMigrationLabel,
+  runSquawkScan,
+  stripSqlCommentsAndCollapseWhitespace,
+} from '../migrations/scan.mjs';
+
+const SQUAWK_VERSION = '2.74.0';
+
+function isSquawkInstalled(dir) {
+  try {
+    const pkgFile = path.join(dir, 'node_modules/squawk-cli/package.json');
+    const binFile = path.join(dir, 'node_modules/.bin/squawk');
+    if (!existsSync(pkgFile) || !existsSync(binFile)) return false;
+    return JSON.parse(readFileSync(pkgFile, 'utf8'))?.version === SQUAWK_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+let cachedSquawkDir = null;
+
+function ensureSquawkInstall() {
+  if (cachedSquawkDir && isSquawkInstalled(cachedSquawkDir)) return cachedSquawkDir;
+  const sharedDir = path.join(os.tmpdir(), `migrations-test-squawk-${SQUAWK_VERSION}`);
+  if (isSquawkInstalled(sharedDir)) {
+    cachedSquawkDir = sharedDir;
+    return sharedDir;
+  }
+  const staged = mkdtempSync(
+    path.join(os.tmpdir(), `migrations-test-squawk-${SQUAWK_VERSION}-${process.pid}-`),
+  );
+  try {
+    execFileSync(
+      'npm',
+      ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', `squawk-cli@${SQUAWK_VERSION}`],
+      { cwd: staged, stdio: 'inherit' },
+    );
+    assert.equal(isSquawkInstalled(staged), true);
+  } catch (err) {
+    rmSync(staged, { recursive: true, force: true });
+    throw err;
+  }
+  if (!existsSync(sharedDir)) {
+    try {
+      renameSync(staged, sharedDir);
+      cachedSquawkDir = sharedDir;
+      return sharedDir;
+    } catch {
+      if (isSquawkInstalled(sharedDir)) {
+        rmSync(staged, { recursive: true, force: true });
+        cachedSquawkDir = sharedDir;
+        return sharedDir;
+      }
+    }
+  }
+  process.once('exit', () => rmSync(staged, { recursive: true, force: true }));
+  cachedSquawkDir = staged;
+  return staged;
+}
+
+function populateFiles(root, files) {
+  for (const [rel, body] of Object.entries(files)) {
+    const target = path.join(root, rel);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, body.endsWith('\n') ? body : `${body}\n`, 'utf8');
+  }
+}
+
+function createRepoWithCommit(files) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-repo-'));
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  populateFiles(dir, files);
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  execFileSync('git', ['commit', '-qm', 'base'], { cwd: dir });
+  const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+  return { dir, baseSha };
+}
+
+function commitAll(dir, msg) {
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  execFileSync('git', ['commit', '-qm', msg], { cwd: dir });
+  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+}
+
+test('parses static .squawk.toml profiles and enforces default zero-config rules', () => {
+  assert.equal(DEFAULT_PG_VERSION, '17.0');
+  assert.equal(DEFAULT_EXCLUDED_RULES.length, 9);
+  for (const rule of CONCURRENT_INDEX_RULES) {
+    assert.ok(DEFAULT_EXCLUDED_RULES.includes(rule));
+  }
+
+  const parsed = parseSquawkToml(
+    [
+      '\ufeff# repository config',
+      'pg_version = "16.0"',
+      'assume_in_transaction = false',
+      'excluded_rules = [',
+      '  "ban-drop-column", # intentional',
+      '  "invalid rule!",',
+      ']',
+      'included_rules = ["require-table-schema"]',
+      'excluded_paths = ["drizzle/legacy/*", "../escape.sql", "/abs.sql", "0001_init.sql"]',
+      '[ignored_section]',
+      'assume_in_transaction = true',
+    ].join('\n'),
+  );
+
+  assert.deepEqual(parsed, {
+    pg_version: '16.0',
+    assume_in_transaction: false,
+    excluded_rules: ['ban-drop-column'],
+    included_rules: ['require-table-schema'],
+    excluded_paths: ['drizzle/legacy/*', '0001_init.sql'],
+  });
+
+  assert.equal(matchesExcludedPath('apps/api/drizzle/0001_init.sql', '0001_init.sql'), true);
+  assert.equal(matchesExcludedPath('drizzle/legacy/0002_old.sql', 'drizzle/legacy/*'), true);
+  assert.equal(matchesExcludedPath('drizzle/active/0002_old.sql', 'drizzle/legacy/*'), false);
+
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-cfg-'));
+  try {
+    // 1. Default zero-config profile when no `.squawk.toml` exists.
+    const defaultProfile = resolveSquawkProfile(tmp, 'apps/api/drizzle/0001_init.sql');
+    assert.equal(defaultProfile.pgVersion, '17.0');
+    assert.equal(defaultProfile.assumeInTransaction, true);
+    assert.deepEqual(defaultProfile.excludedRules, DEFAULT_EXCLUDED_RULES);
+
+    // 2. `assume_in_transaction = false` without explicit `excluded_rules` keeps `require-concurrent-index-*` active.
+    populateFiles(tmp, {
+      '.squawk.toml': 'assume_in_transaction = false\nincluded_rules = ["prefer-text-field"]\n',
+    });
+    const nonTxProfile = resolveSquawkProfile(tmp, 'migrations/0001_idx.sql');
+    assert.equal(nonTxProfile.assumeInTransaction, false);
+    assert.equal(nonTxProfile.excludedRules.includes('require-concurrent-index-creation'), false);
+    assert.equal(nonTxProfile.excludedRules.includes('require-concurrent-index-deletion'), false);
+    assert.equal(nonTxProfile.excludedRules.includes('prefer-text-field'), false);
+    assert.equal(nonTxProfile.excludedRules.includes('require-lock-timeout'), true);
+
+    const serialized = serializeSquawkToml(nonTxProfile);
+    assert.match(serialized, /assume_in_transaction = false/);
+    assert.match(serialized, /included_rules = \["prefer-text-field"\]/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('classifies PostgreSQL migrations and skips ClickHouse, SQLite, MySQL, dumps, and test fixtures', () => {
+  const { dir } = createRepoWithCommit({
+    'apps/api/drizzle/meta/_journal.json': JSON.stringify({ dialect: 'postgresql', version: '7', entries: [] }),
+    'apps/api/drizzle/0000_init.sql': 'CREATE TABLE "accounts" ("id" uuid PRIMARY KEY);',
+    'apps/api/test/fixtures/drizzle/meta/_journal.json': JSON.stringify({ dialect: 'postgresql', version: '7' }),
+    'apps/api/test/fixtures/drizzle/0000_fixture.sql': 'CREATE TABLE "f" ("id" text);',
+    'packages/db/package.json': JSON.stringify({
+      name: '@acme/db',
+      dependencies: { pg: '^8.13.0', 'drizzle-orm': '^0.40.0' },
+    }),
+    'packages/db/migrations/0001_sessions.sql': 'CREATE TABLE sessions (id text PRIMARY KEY);',
+    'packages/db/ops/grants.sql': 'GRANT SELECT ON sessions TO reader;',
+    'apps/analytics/clickhouse/migrations/0001_events.sql':
+      'CREATE TABLE events (id String) ENGINE = MergeTree ORDER BY id;',
+    'apps/analytics/migrations/0002_ch_header.sql':
+      'CREATE TABLE metrics (ts DateTime64(3), tag LowCardinality(String)) ENGINE = ReplacingMergeTree ORDER BY ts;',
+    'apps/local-sqlite/drizzle/meta/_journal.json': JSON.stringify({ dialect: 'sqlite', version: '7' }),
+    'apps/local-sqlite/drizzle/0000_local.sql': 'CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT);',
+    'apps/legacy-mysql/migrations/0001_mysql.sql':
+      'CREATE TABLE orders (id BIGINT AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB;',
+    'db/structure.sql': 'SET statement_timeout = 0; CREATE TABLE schema_migrations (version varchar);',
+    'db/views/active_accounts_v01.sql': 'SELECT id FROM accounts;',
+  });
+
+  try {
+    const cache = createClassifierCache(dir);
+    assert.equal(isRealPathInsideRepo(path.join(dir, 'db/structure.sql'), cache.realRepoRoot), true);
+    assert.equal(classifySqlFile(dir, 'apps/api/drizzle/0000_init.sql', cache).include, true);
+    assert.equal(classifySqlFile(dir, 'packages/db/migrations/0001_sessions.sql', cache).include, true);
+
+    assert.equal(classifySqlFile(dir, 'apps/api/test/fixtures/drizzle/0000_fixture.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'packages/db/ops/grants.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'apps/analytics/clickhouse/migrations/0001_events.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'apps/analytics/migrations/0002_ch_header.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'apps/local-sqlite/drizzle/0000_local.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'apps/legacy-mysql/migrations/0001_mysql.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'db/structure.sql', cache).include, false);
+    assert.equal(classifySqlFile(dir, 'db/views/active_accounts_v01.sql', cache).include, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('passes safe Drizzle CREATE TABLE migrations and fails newly introduced unsafe DDL with 1-based lines', () => {
+  const squawkDir = ensureSquawkInstall();
+  const { dir, baseSha } = createRepoWithCommit({
+    'apps/service/drizzle/meta/_journal.json': JSON.stringify({
+      dialect: 'postgresql',
+      version: '7',
+      entries: [{ idx: 0, tag: '0000_initial' }],
+    }),
+    'apps/service/drizzle/0000_initial.sql': [
+      'CREATE TABLE "accounts" (',
+      '  "id" uuid PRIMARY KEY NOT NULL,',
+      '  "slug" varchar(120) NOT NULL',
+      ');',
+      '--> statement-breakpoint',
+      'CREATE INDEX "accounts_slug_idx" ON "accounts" ("slug");',
+    ].join('\n'),
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-out-'));
+
+  try {
+    // 1. Safe additive migration with Drizzle `--> statement-breakpoint` and `varchar`/`CREATE INDEX` passes `0`.
+    populateFiles(dir, {
+      'apps/service/drizzle/0001_safe_table.sql': [
+        'CREATE TYPE "public"."item_state" AS ENUM(\'draft\', \'published\');--> statement-breakpoint',
+        'CREATE TABLE "items" (',
+        '  "id" serial PRIMARY KEY NOT NULL,',
+        '  "label" varchar(255) NOT NULL,',
+        '  "state" "item_state" DEFAULT \'draft\' NOT NULL',
+        ');',
+        '--> statement-breakpoint',
+        'CREATE INDEX "items_label_idx" ON "items" ("label");',
+      ].join('\n'),
+    });
+    commitAll(dir, 'add safe table');
+
+    const cleanOut = path.join(scratch, 'clean-output.txt');
+    const cleanRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+      githubOutput: cleanOut,
+    });
+    assert.equal(cleanRes.exitCode, 0);
+    assert.equal(cleanRes.scope, 'sql');
+    assert.equal(cleanRes.state, 'clean');
+    assert.equal(cleanRes.report.addedCount, 0);
+
+    // 2. Unsafe migration adding NOT NULL without default, DROP COLUMN, unvalidated FK, and CONCURRENTLY in tx fails `1`.
+    populateFiles(dir, {
+      'apps/service/drizzle/0002_unsafe_alter.sql': [
+        '/* UTF-8 header: 数据库迁移 */ ALTER TABLE "accounts" ADD COLUMN "tier" text NOT NULL;',
+        '--> statement-breakpoint',
+        'ALTER TABLE "accounts" DROP COLUMN "slug";',
+        '--> statement-breakpoint',
+        'ALTER TABLE "accounts" ADD CONSTRAINT "accounts_parent_fk" FOREIGN KEY ("id") REFERENCES "orgs"("id");',
+        '--> statement-breakpoint',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS "accounts_tier_idx" ON "accounts" ("tier");',
+      ].join('\n'),
+    });
+    commitAll(dir, 'add unsafe alter');
+
+    const failOut = path.join(scratch, 'fail-output.txt');
+    const summaryFile = path.join(scratch, 'summary.md');
+    const failRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+      githubOutput: failOut,
+      githubStepSummary: summaryFile,
+    });
+
+    assert.equal(failRes.exitCode, 1);
+    assert.equal(failRes.state, 'failed');
+    assert.equal(failRes.report.checkedFiles, 2);
+
+    const rulesByLine = failRes.report.added.map((r) => `${r.line}:${r.rule}`);
+    assert.ok(rulesByLine.includes('1:adding-required-field'), `Got: ${rulesByLine.join(', ')}`);
+    assert.ok(rulesByLine.includes('3:ban-drop-column'), `Got: ${rulesByLine.join(', ')}`);
+    assert.ok(rulesByLine.includes('5:constraint-missing-not-valid'), `Got: ${rulesByLine.join(', ')}`);
+    assert.ok(rulesByLine.includes('5:adding-foreign-key-constraint'), `Got: ${rulesByLine.join(', ')}`);
+    assert.ok(
+      rulesByLine.includes('7:ban-concurrent-index-creation-in-transaction'),
+      `Got: ${rulesByLine.join(', ')}`,
+    );
+
+    const summaryMd = readFileSync(summaryFile, 'utf8');
+    assert.match(summaryMd, /https:\/\/squawkhq\.com\/docs\/ban-drop-column/);
+    assert.match(summaryMd, /allow-unsafe-migration/);
+    assert.equal(formatMigrationStepSummary({ ...failRes.report, addedCount: 0, added: [] }), '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('diffs modified and renamed historical migrations so comment/format edits pass while new unsafe statements fail', () => {
+  const squawkDir = ensureSquawkInstall();
+  const { dir, baseSha } = createRepoWithCommit({
+    'drizzle/meta/_journal.json': JSON.stringify({ dialect: 'postgresql', version: '7', entries: [] }),
+    'drizzle/0001_historical.sql': [
+      '-- Historical cutover migration applied in production',
+      'CREATE TABLE "audit_events" (',
+      '  "id" uuid PRIMARY KEY NOT NULL,',
+      '  "actor_id" uuid NOT NULL,',
+      '  "payload" jsonb NOT NULL',
+      ');',
+      '--> statement-breakpoint',
+      'ALTER TABLE "members" DROP COLUMN "legacy_flag";',
+      '--> statement-breakpoint',
+      'ALTER TABLE "members" ADD COLUMN "role" text NOT NULL;',
+    ].join('\n'),
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-diff-'));
+
+  try {
+    // 1. Rename file + add comments + reformat existing unsafe statements -> 0 newly introduced violations!
+    execFileSync('git', ['mv', 'drizzle/0001_historical.sql', 'drizzle/0001_historical_renamed.sql'], {
+      cwd: dir,
+    });
+    populateFiles(dir, {
+      'drizzle/0001_historical_renamed.sql': [
+        '-- Historical cutover migration applied in production (note updated)',
+        '-- Second header line shifting every subsequent line number',
+        'CREATE TABLE "audit_events" (',
+        '  "id" uuid PRIMARY KEY NOT NULL,',
+        '  "actor_id" uuid NOT NULL,',
+        '  "payload" jsonb NOT NULL',
+        ');',
+        '--> statement-breakpoint',
+        'ALTER TABLE "members"',
+        '  DROP COLUMN "legacy_flag"; -- inline comment',
+        '--> statement-breakpoint',
+        'ALTER TABLE "members" ADD COLUMN "role" text NOT NULL;',
+      ].join('\n'),
+    });
+    const head1 = commitAll(dir, 'rename and reformat historical migration');
+    assert.equal(collectChangedSqlEntries(dir, baseSha, head1)[0].kind, 'renamed');
+
+    const res1 = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(res1.exitCode, 0);
+    assert.equal(res1.state, 'clean');
+    assert.equal(res1.report.beforeCount, 2);
+    assert.equal(res1.report.afterCount, 2);
+    assert.equal(res1.report.addedCount, 0);
+
+    // 2. Appending a new unsafe DROP COLUMN on another column in that same file flags ONLY the 1 new violation!
+    populateFiles(dir, {
+      'drizzle/0001_historical_renamed.sql': [
+        '-- Historical cutover migration applied in production (note updated)',
+        'CREATE TABLE "audit_events" (',
+        '  "id" uuid PRIMARY KEY NOT NULL,',
+        '  "actor_id" uuid NOT NULL,',
+        '  "payload" jsonb NOT NULL',
+        ');',
+        '--> statement-breakpoint',
+        'ALTER TABLE "members" DROP COLUMN "legacy_flag";',
+        '--> statement-breakpoint',
+        'ALTER TABLE "members" ADD COLUMN "role" text NOT NULL;',
+        '--> statement-breakpoint',
+        'ALTER TABLE "members" DROP COLUMN "newly_dropped_col";',
+      ].join('\n'),
+    });
+    commitAll(dir, 'append new drop column');
+
+    const res2 = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(res2.exitCode, 1);
+    assert.equal(res2.state, 'failed');
+    assert.equal(res2.report.addedCount, 1);
+    assert.equal(res2.report.added[0].rule, 'ban-drop-column');
+    assert.equal(res2.report.added[0].line, 12);
+
+    // Exercise helper signatures directly as well.
+    assert.equal(
+      stripSqlCommentsAndCollapseWhitespace('ALTER /* c */ TABLE "x"\n  DROP COLUMN "y"; -- end'),
+      'ALTER TABLE "x" DROP COLUMN "y";',
+    );
+    assert.equal(
+      extractStatementSignature(['ALTER TABLE "x" DROP COLUMN "y";'], {
+        line: 0,
+        line_end: 0,
+        column: 16,
+        column_end: 31,
+      }),
+      'ALTER TABLE "x" :: DROP COLUMN "y"',
+    );
+    assert.equal(diffMigrationFindings(res2.report.added, []).resolvedCount, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('skips ClickHouse-only PRs, honors -- squawk-ignore and allow-unsafe-migration waivers, and respects .squawk.toml', () => {
+  const squawkDir = ensureSquawkInstall();
+  const { dir, baseSha } = createRepoWithCommit({
+    'package.json': JSON.stringify({ name: 'svc', dependencies: { pg: '^8.0.0' } }),
+    'README.md': '# Demo\n',
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-waive-'));
+
+  try {
+    // 1. ClickHouse SQL touched -> `scope=skip`, `state=clean`, `exit 0`.
+    populateFiles(dir, {
+      'clickhouse/migrations/0001_telemetry.sql':
+        'CREATE TABLE telemetry (ts DateTime64(3)) ENGINE = MergeTree ORDER BY ts;',
+    });
+    commitAll(dir, 'add clickhouse migration');
+    const skipOut = path.join(scratch, 'skip.out');
+    const skipRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+      githubOutput: skipOut,
+    });
+    assert.equal(skipRes.exitCode, 0);
+    assert.equal(skipRes.scope, 'skip');
+    assert.equal(skipRes.state, 'clean');
+    assert.match(readFileSync(skipOut, 'utf8'), /scope=skip/);
+
+    // 2. Inline `-- squawk-ignore` (after `--> statement-breakpoint`) and `-- squawk-ignore-file` pass `exit 0`.
+    populateFiles(dir, {
+      'migrations/0001_waived_inline.sql': [
+        'CREATE TABLE IF NOT EXISTS "orders" ("id" uuid PRIMARY KEY);',
+        '--> statement-breakpoint',
+        '-- squawk-ignore ban-drop-column',
+        'ALTER TABLE "customers" DROP COLUMN IF EXISTS "obsolete_phone";',
+      ].join('\n'),
+      'migrations/0002_waived_file.sql': [
+        '-- squawk-ignore-file',
+        'ALTER TABLE "customers" DROP COLUMN "obsolete_fax";',
+      ].join('\n'),
+    });
+    commitAll(dir, 'add inline-ignored migrations');
+    const inlineRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(inlineRes.exitCode, 0);
+    assert.equal(inlineRes.state, 'clean');
+
+    // 3. Unwaived violation waived via `allow-unsafe-migration` PR label -> `state=waived`, `exit 0`.
+    assert.equal(hasAllowUnsafeMigrationLabel('["bug","allow-unsafe-migration"]'), true);
+    assert.equal(hasAllowUnsafeMigrationLabel('["other"]'), false);
+    assert.equal(hasAllowUnsafeMigrationLabel('not-json'), false);
+
+    populateFiles(dir, {
+      'migrations/[v2]/0003_unwaived.sql': 'ALTER TABLE "customers" DROP COLUMN "legacy_notes";',
+    });
+    commitAll(dir, 'add unwaived drop');
+
+    const waivedSummary = path.join(scratch, 'waived-summary.md');
+    const waivedRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      labelsJson: JSON.stringify(['allow-unsafe-migration']),
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+      githubStepSummary: waivedSummary,
+    });
+    assert.equal(waivedRes.exitCode, 0);
+    assert.equal(waivedRes.state, 'waived');
+    assert.equal(waivedRes.report.waived, true);
+    assert.equal(waivedRes.report.addedCount, 1);
+    assert.equal(waivedRes.report.added[0].file, 'migrations/[v2]/0003_unwaived.sql');
+    assert.match(readFileSync(waivedSummary, 'utf8'), /waived via `allow-unsafe-migration` label/);
+
+    // 4. `.squawk.toml` override (`assume_in_transaction = false` + `excluded_paths`) + symlink safety.
+    populateFiles(dir, {
+      '.squawk.toml': [
+        'assume_in_transaction = false',
+        'excluded_paths = ["migrations/[[]v2]/*"]',
+      ].join('\n'),
+      'migrations/0004_non_concurrent_idx.sql': 'CREATE INDEX IF NOT EXISTS "orders_created_idx" ON "orders" ("id");',
+      'migrations/0005_concurrent_idx.sql':
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS "orders_conc_idx" ON "orders" ("id");',
+    });
+    commitAll(dir, 'configure non-transactional squawk toml');
+
+    const tomlRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(tomlRes.exitCode, 1);
+    assert.equal(tomlRes.report.addedCount, 1);
+    assert.equal(tomlRes.report.added[0].file, 'migrations/0004_non_concurrent_idx.sql');
+    assert.equal(tomlRes.report.added[0].rule, 'require-concurrent-index-creation');
+
+    // Direct `runSquawkScan` check with dash-prefixed filename and symlinked `.squawk.toml` ignored.
+    const outsideFile = path.join(scratch, 'outside.toml');
+    writeFileSync(outsideFile, 'excluded_rules = ["ban-drop-column"]\n', 'utf8');
+    rmSync(path.join(dir, '.squawk.toml'), { force: true });
+    symlinkSync(outsideFile, path.join(dir, '.squawk.toml'));
+    populateFiles(dir, {
+      'migrations/-e=ban-drop-column.sql': 'ALTER TABLE "customers" DROP COLUMN "x";',
+    });
+    const symlinkProfile = resolveSquawkProfile(dir, 'migrations/-e=ban-drop-column.sql');
+    assert.equal(symlinkProfile.tomlRelDir, null);
+    const dashFindings = runSquawkScan({
+      targetDir: dir,
+      squawkInstallDir: squawkDir,
+      tempDir: scratch,
+      side: 'dash',
+      files: ['migrations/-e=ban-drop-column.sql'],
+      profile: symlinkProfile,
+    });
+    assert.equal(dashFindings.length, 1);
+    assert.equal(dashFindings[0].rule, 'ban-drop-column');
+
+    // 5. Unreachable BASE SHA fails open (`state=unavailable`, `exit 0`).
+    const unavailOut = path.join(scratch, 'unavail.out');
+    const unavailRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: 'deadbeef'.repeat(5),
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+      githubOutput: unavailOut,
+    });
+    assert.equal(unavailRes.exitCode, 0);
+    assert.equal(unavailRes.state, 'unavailable');
+    assert.match(readFileSync(unavailOut, 'utf8'), /state=unavailable/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
