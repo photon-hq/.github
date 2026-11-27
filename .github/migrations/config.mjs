@@ -48,11 +48,14 @@ const NON_MIGRATION_DIRS = new Set([
 ]);
 
 const DEDICATED_MIGRATION_DIR_RE =
-  /^(?:drizzle(?:-[a-z0-9_]+)?|migrations?|migrate|(?:pg|postgres|postgresql)[-_]migrations?)$/i;
+  /^(?:drizzle(?:-[a-z0-9_]+)?|migrations?|migrate|[a-z0-9_]+[-_]migrations?)$/i;
 const GENERIC_SQL_DIR_RE = /^(?:sql|db)$/i;
 const NON_PG_SEGMENT_RE =
   /(?:clickhouse|^\.signoz$|^(?:mysql|mariadb|vitess|tidb|sqlite3?|libsql|turso|d1|bigquery|snowflake|duckdb)$|(?:^|[-_])(?:mysql|mariadb|sqlite3?|libsql)(?:$|[-_]))/i;
 const TEST_OR_SEED_FILENAME_RE = /(?:^|[-_.])(?:fixture|seed|test|spec)\.sql$/i;
+const NON_TRANSACTIONAL_FILENAME_RE = /\.(?:nontransactional|no-transaction)\.sql$/i;
+const NON_TRANSACTIONAL_HEADER_RE =
+  /(?:^|[^a-z0-9])(?:no-transaction|nontransactional)(?:$|[^a-z0-9])/i;
 
 const DIRECT_PG_PACKAGES = new Set([
   'pg',
@@ -123,13 +126,26 @@ function isSafeRelativeGlob(pattern) {
   return normalized.split('/').every((seg) => seg !== '..');
 }
 
-function unescapeTomlBasicString(body) {
+export function normalizeGitRelPath(rawPath) {
+  if (typeof rawPath !== 'string') return '';
+  const platformNormalized = process.platform === 'win32' ? rawPath.replace(/\\/g, '/') : rawPath;
+  return platformNormalized.replace(/^(?:\.\/)+/, '');
+}
+
+function unescapeTomlBasicString(body, isMultiline = false) {
   let out = '';
   for (let i = 0; i < body.length; i++) {
     const ch = body[i];
     if (ch !== '\\') {
       out += ch;
       continue;
+    }
+    if (isMultiline) {
+      const cont = body.slice(i).match(/^\\[ \t]*\r?\n[ \t\r\n]*/);
+      if (cont) {
+        i += cont[0].length - 1;
+        continue;
+      }
     }
     const next = body[++i];
     if (next === undefined) break;
@@ -151,8 +167,6 @@ function unescapeTomlBasicString(body) {
         }
       }
       out += next;
-    } else if (next === '\n' || next === '\r') {
-      while (i + 1 < body.length && /\s/.test(body[i + 1])) i++;
     } else {
       out += next;
     }
@@ -196,7 +210,7 @@ function tokenizeToml(source) {
       if (end < 0) return null;
       const raw = src.slice(i, end);
       i = end + 3;
-      tokens.push({ type: 'string', value: isBasic ? unescapeTomlBasicString(raw) : raw });
+      tokens.push({ type: 'string', value: isBasic ? unescapeTomlBasicString(raw, true) : raw });
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -221,13 +235,14 @@ function tokenizeToml(source) {
         i++;
       }
       if (!closed) return null;
-      tokens.push({ type: 'string', value: isBasic ? unescapeTomlBasicString(raw) : raw });
+      tokens.push({ type: 'string', value: isBasic ? unescapeTomlBasicString(raw, false) : raw });
       continue;
     }
     let word = '';
     while (i < src.length && !/[\s#=\[\],"']/.test(src[i])) {
       word += src[i++];
     }
+    if (word === '') return null;
     tokens.push({ type: 'bare', value: word });
   }
 
@@ -464,8 +479,162 @@ function readTomlAtDir(cache, relDir) {
   return parsed;
 }
 
-export function resolveSquawkProfile(repoDir, relFilePath, existingCache = null) {
+export function scanSqlTokens(sql, { keepQuotes = true, onStatementBreak = null } = {}) {
+  if (typeof sql !== 'string' || !sql) return '';
+  let out = '';
+  const pushSpace = () => {
+    if (out.length > 0 && !out.endsWith(' ')) out += ' ';
+  };
+
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === '-' && sql[i + 1] === '-') {
+      const commentStart = i;
+      i += 2;
+      while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++;
+      const commentLine = sql.slice(commentStart, i);
+      if (sql[i] === '\r' && sql[i + 1] === '\n') i += 2;
+      else if (sql[i] === '\n' || sql[i] === '\r') i++;
+      if (onStatementBreak && /^-->\s*statement-breakpoint\s*$/i.test(commentLine)) {
+        onStatementBreak(i);
+      }
+      pushSpace();
+      continue;
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      i += 2;
+      let depth = 1;
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === '/' && sql[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sql[i] === '*' && sql[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      pushSpace();
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      const prev = i > 0 ? sql[i - 1] : '';
+      const prev2 = i > 1 ? sql[i - 2] : '';
+      const cEscape =
+        quote === "'" &&
+        (prev === 'E' || prev === 'e') &&
+        (i === 1 || !/[A-Za-z0-9_$]/.test(prev2));
+      const tokenStart = i++;
+      while (i < sql.length) {
+        const c = sql[i++];
+        if (cEscape && c === '\\' && i < sql.length) {
+          i++;
+          continue;
+        }
+        if (c === quote) {
+          if (sql[i] === quote) {
+            i++;
+            continue;
+          }
+          break;
+        }
+      }
+      if (keepQuotes) out += sql.slice(tokenStart, i);
+      else pushSpace();
+      continue;
+    }
+    if (ch === '$') {
+      const dollarMatch = sql.slice(i).match(/^\$(?:[A-Za-z_\x80-\uffff][A-Za-z0-9_\x80-\uffff]*)?\$/);
+      if (dollarMatch) {
+        const delim = dollarMatch[0];
+        const closeIdx = sql.indexOf(delim, i + delim.length);
+        const tokenEnd = closeIdx >= 0 ? closeIdx + delim.length : sql.length;
+        if (keepQuotes) out += sql.slice(i, tokenEnd);
+        else pushSpace();
+        i = tokenEnd;
+        continue;
+      }
+    }
+    if (/\s/.test(ch)) {
+      pushSpace();
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+    if (ch === ';' && onStatementBreak) {
+      onStatementBreak(i);
+    }
+  }
+  return out.trim();
+}
+
+export function isNonTransactionalMigrationFile(relFilePath, sqlSample = '') {
+  const cleanRel = normalizeGitRelPath(relFilePath);
+  if (NON_TRANSACTIONAL_FILENAME_RE.test(path.posix.basename(cleanRel))) {
+    return true;
+  }
+  if (typeof sqlSample !== 'string' || !sqlSample) return false;
+  let i = sqlSample.startsWith('\ufeff') ? 1 : 0;
+  while (i < sqlSample.length) {
+    const ch = sqlSample[i];
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      i++;
+      continue;
+    }
+    if (ch === '-' && sqlSample[i + 1] === '-') {
+      let end = i + 2;
+      while (end < sqlSample.length && sqlSample[end] !== '\n' && sqlSample[end] !== '\r') end++;
+      if (NON_TRANSACTIONAL_HEADER_RE.test(sqlSample.slice(i + 2, end))) return true;
+      i = end;
+      continue;
+    }
+    if (ch === '/' && sqlSample[i + 1] === '*') {
+      i += 2;
+      let depth = 1;
+      while (i < sqlSample.length && depth > 0) {
+        if (sqlSample[i] === '/' && sqlSample[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sqlSample[i] === '*' && sqlSample[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
+function computeExcludedRules(assumeInTransaction, explicitExcludedRules, includedRules) {
+  if (explicitExcludedRules !== null) return explicitExcludedRules;
+  const includedSet = new Set(includedRules);
+  const baseExcluded = assumeInTransaction
+    ? DEFAULT_EXCLUDED_RULES
+    : DEFAULT_EXCLUDED_RULES.filter((r) => !CONCURRENT_INDEX_RULES.includes(r));
+  return baseExcluded.filter((r) => !includedSet.has(r));
+}
+
+function readSqlSampleIfRegular(repoDir, relFilePath, realRepoRoot) {
+  const absPath = path.join(repoDir, relFilePath);
+  if (!isRegularRepoFile(absPath, realRepoRoot)) return null;
+  try {
+    return readFileSync(absPath).subarray(0, 16 * 1024).toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+export function resolveSquawkProfile(repoDir, rawRelFilePath, existingCache = null, sqlSample = null) {
   const cache = existingCache ?? createClassifierCache(repoDir);
+  const relFilePath = normalizeGitRelPath(rawRelFilePath);
   let foundDir = null;
   let parsed = null;
 
@@ -479,19 +648,24 @@ export function resolveSquawkProfile(repoDir, relFilePath, existingCache = null)
   }
 
   const pgVersion = parsed?.pg_version ?? DEFAULT_PG_VERSION;
-  const assumeInTransaction = parsed?.assume_in_transaction ?? true;
-  const includedRules = parsed?.included_rules ?? [];
-  const includedSet = new Set(includedRules);
+  const explicitAssumeInTransaction = parsed?.assume_in_transaction !== undefined;
+  const sample =
+    !explicitAssumeInTransaction && sqlSample === null
+      ? (readSqlSampleIfRegular(repoDir, relFilePath, cache.realRepoRoot) ?? '')
+      : (sqlSample ?? '');
+  const nonTransactionalMarker =
+    !explicitAssumeInTransaction && isNonTransactionalMigrationFile(relFilePath, sample);
+  const assumeInTransaction = explicitAssumeInTransaction
+    ? parsed.assume_in_transaction
+    : !nonTransactionalMarker;
 
-  let excludedRules;
-  if (parsed?.excluded_rules !== undefined) {
-    excludedRules = parsed.excluded_rules;
-  } else {
-    const baseExcluded = assumeInTransaction
-      ? DEFAULT_EXCLUDED_RULES
-      : DEFAULT_EXCLUDED_RULES.filter((r) => !CONCURRENT_INDEX_RULES.includes(r));
-    excludedRules = baseExcluded.filter((r) => !includedSet.has(r));
-  }
+  const includedRules = parsed?.included_rules ?? [];
+  const explicitExcludedRules = parsed?.excluded_rules !== undefined ? parsed.excluded_rules : null;
+  const excludedRules = computeExcludedRules(
+    assumeInTransaction,
+    explicitExcludedRules,
+    includedRules,
+  );
 
   const rawExcludedPaths = parsed?.excluded_paths ?? [];
   const excludedPaths = [];
@@ -509,10 +683,31 @@ export function resolveSquawkProfile(repoDir, relFilePath, existingCache = null)
   return {
     pgVersion,
     assumeInTransaction,
+    explicitAssumeInTransaction,
+    explicitExcludedRules,
     excludedRules,
     includedRules,
     excludedPaths,
     tomlRelDir: foundDir,
+  };
+}
+
+export function resolveBaseFileProfile(baseRepoDir, rawBaseRelPath, headProfile, baseCache) {
+  const baseRelPath = normalizeGitRelPath(rawBaseRelPath);
+  if (headProfile.explicitAssumeInTransaction) {
+    return { ...headProfile, excludedPaths: [] };
+  }
+  const sample = readSqlSampleIfRegular(baseRepoDir, baseRelPath, baseCache.realRepoRoot) ?? '';
+  const assumeInTransaction = !isNonTransactionalMigrationFile(baseRelPath, sample);
+  return {
+    ...headProfile,
+    assumeInTransaction,
+    excludedRules: computeExcludedRules(
+      assumeInTransaction,
+      headProfile.explicitExcludedRules ?? null,
+      headProfile.includedRules,
+    ),
+    excludedPaths: [],
   };
 }
 
@@ -679,79 +874,103 @@ function detectNonPostgresSqlContent(sqlSample) {
       return true;
     }
   }
-  const withoutComments = sqlSample
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/--[^\r\n]*/g, ' ');
+  const unquoted = scanSqlTokens(sqlSample, { keepQuotes: false });
   return (
-    CLICKHOUSE_SQL_RE.test(withoutComments) ||
-    MYSQL_SQL_RE.test(withoutComments) ||
-    SQLITE_SQL_RE.test(withoutComments)
+    CLICKHOUSE_SQL_RE.test(unquoted) ||
+    MYSQL_SQL_RE.test(unquoted) ||
+    SQLITE_SQL_RE.test(unquoted)
   );
 }
 
-export function classifySqlFile(repoDir, rawRelPath, existingCache = null) {
-  const cache = existingCache ?? createClassifierCache(repoDir);
-  const relPath = rawRelPath.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '');
-  const parts = relPath.split('/');
+function checkCandidateSqlPreconditions(relPath, parts, tomlRelDir, sqlSample) {
+  const dirSegments = parts.slice(0, -1);
+  const fileName = parts[parts.length - 1];
 
+  if (dirSegments.some((seg) => NON_PG_SEGMENT_RE.test(seg))) {
+    return 'non-postgres-path';
+  }
+
+  const lowerParts = parts.map((p) => p.toLowerCase());
+  const dbIdx = lowerParts.lastIndexOf('db');
+  if (dbIdx >= 0) {
+    if (dbIdx === lowerParts.length - 2 && lowerParts[lowerParts.length - 1] === 'structure.sql') {
+      return 'schema-dump';
+    }
+    if (lowerParts[dbIdx + 1] === 'views') {
+      return 'view-snapshot';
+    }
+  }
+
+  const tomlSegments = tomlRelDir && tomlRelDir !== '.' ? tomlRelDir.split('/') : [];
+  const hasUntargetedNonMigrationDir = dirSegments.some(
+    (seg, idx) => NON_MIGRATION_DIRS.has(seg.toLowerCase()) && tomlSegments[idx] !== seg,
+  );
+  if (
+    hasUntargetedNonMigrationDir ||
+    (tomlSegments.length === 0 && TEST_OR_SEED_FILENAME_RE.test(fileName))
+  ) {
+    return 'test-or-fixture';
+  }
+
+  if (detectNonPostgresSqlContent(sqlSample)) {
+    return 'non-postgres-sql';
+  }
+
+  return null;
+}
+
+function readVerifiedSqlCandidate(repoDir, rawRelPath, cache) {
+  const relPath = normalizeGitRelPath(rawRelPath);
+  const parts = relPath.split('/');
   if (
     !relPath ||
     !relPath.toLowerCase().endsWith('.sql') ||
     relPath.startsWith('/') ||
     parts.some((p) => !p || p === '.' || p === '..' || ALWAYS_SKIP_DIRS.has(p))
   ) {
-    return { include: false, reason: 'ignored-path', profile: null };
+    return { ok: false, reason: 'ignored-path', relPath, parts, sqlSample: null };
   }
-
-  const absPath = path.join(repoDir, relPath);
-  if (!isRegularRepoFile(absPath, cache.realRepoRoot)) {
-    return { include: false, reason: 'missing-or-irregular', profile: null };
+  const sqlSample = readSqlSampleIfRegular(repoDir, relPath, cache.realRepoRoot);
+  if (sqlSample === null) {
+    return { ok: false, reason: 'missing-or-irregular', relPath, parts, sqlSample: null };
   }
+  return { ok: true, reason: null, relPath, parts, sqlSample };
+}
 
-  const profile = resolveSquawkProfile(repoDir, relPath, cache);
+export function canCompareAsBaseMigrationSql(repoDir, rawRelPath, headProfile, existingCache = null) {
+  const cache = existingCache ?? createClassifierCache(repoDir);
+  const candidate = readVerifiedSqlCandidate(repoDir, rawRelPath, cache);
+  if (!candidate.ok) return false;
+  return (
+    checkCandidateSqlPreconditions(
+      candidate.relPath,
+      candidate.parts,
+      headProfile?.tomlRelDir ?? null,
+      candidate.sqlSample,
+    ) === null
+  );
+}
+
+export function classifySqlFile(repoDir, rawRelPath, existingCache = null) {
+  const cache = existingCache ?? createClassifierCache(repoDir);
+  const candidate = readVerifiedSqlCandidate(repoDir, rawRelPath, cache);
+  if (!candidate.ok) {
+    return { include: false, reason: candidate.reason, profile: null };
+  }
+  const { relPath, parts, sqlSample } = candidate;
+
+  const profile = resolveSquawkProfile(repoDir, relPath, cache, sqlSample);
   if (profile.excludedPaths.some((pat) => matchesExcludedPath(relPath, pat))) {
     return { include: false, reason: 'excluded-path', profile };
   }
 
+  const rejection = checkCandidateSqlPreconditions(relPath, parts, profile.tomlRelDir, sqlSample);
+  if (rejection) {
+    return { include: false, reason: rejection, profile };
+  }
+
   const dirSegments = parts.slice(0, -1);
-  const fileName = parts[parts.length - 1];
-
-  if (dirSegments.some((seg) => NON_PG_SEGMENT_RE.test(seg))) {
-    return { include: false, reason: 'non-postgres-path', profile };
-  }
-
-  // Exclude Rails schema dumps and Scenic view snapshots (`db/structure.sql`, `db/views/*.sql`).
   const lowerParts = parts.map((p) => p.toLowerCase());
-  const dbIdx = lowerParts.lastIndexOf('db');
-  if (dbIdx >= 0) {
-    if (dbIdx === lowerParts.length - 2 && lowerParts[lowerParts.length - 1] === 'structure.sql') {
-      return { include: false, reason: 'schema-dump', profile };
-    }
-    if (lowerParts[dbIdx + 1] === 'views') {
-      return { include: false, reason: 'view-snapshot', profile };
-    }
-  }
-
-  // Exclude test/fixture/docs/seed SQL unless a `.squawk.toml` sits inside that subtree.
-  const tomlSegments =
-    profile.tomlRelDir && profile.tomlRelDir !== '.' ? profile.tomlRelDir.split('/') : [];
-  const hasUntargetedNonMigrationDir = dirSegments.some(
-    (seg, idx) => NON_MIGRATION_DIRS.has(seg.toLowerCase()) && tomlSegments[idx] !== seg,
-  );
-  if (hasUntargetedNonMigrationDir || (tomlSegments.length === 0 && TEST_OR_SEED_FILENAME_RE.test(fileName))) {
-    return { include: false, reason: 'test-or-fixture', profile };
-  }
-
-  let sqlSample = '';
-  try {
-    const fdBuf = readFileSync(absPath);
-    sqlSample = fdBuf.subarray(0, 16 * 1024).toString('utf8');
-  } catch {
-    return { include: false, reason: 'unreadable', profile };
-  }
-  if (detectNonPostgresSqlContent(sqlSample)) {
-    return { include: false, reason: 'non-postgres-sql', profile };
-  }
 
   // 1. Drizzle `meta/_journal.json` or `*_snapshot.json` in file dir or parent dir.
   const fileDir = path.posix.dirname(relPath);

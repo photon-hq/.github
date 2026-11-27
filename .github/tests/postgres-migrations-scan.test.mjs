@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -19,6 +18,7 @@ import {
   createClassifierCache,
   DEFAULT_EXCLUDED_RULES,
   DEFAULT_PG_VERSION,
+  isNonTransactionalMigrationFile,
   isRealPathInsideRepo,
   matchesExcludedPath,
   parseSquawkToml,
@@ -53,11 +53,6 @@ let cachedSquawkDir = null;
 
 function ensureSquawkInstall() {
   if (cachedSquawkDir && isSquawkInstalled(cachedSquawkDir)) return cachedSquawkDir;
-  const sharedDir = path.join(os.tmpdir(), `migrations-test-squawk-${SQUAWK_VERSION}`);
-  if (isSquawkInstalled(sharedDir)) {
-    cachedSquawkDir = sharedDir;
-    return sharedDir;
-  }
   const staged = mkdtempSync(
     path.join(os.tmpdir(), `migrations-test-squawk-${SQUAWK_VERSION}-${process.pid}-`),
   );
@@ -71,19 +66,6 @@ function ensureSquawkInstall() {
   } catch (err) {
     rmSync(staged, { recursive: true, force: true });
     throw err;
-  }
-  if (!existsSync(sharedDir)) {
-    try {
-      renameSync(staged, sharedDir);
-      cachedSquawkDir = sharedDir;
-      return sharedDir;
-    } catch {
-      if (isSquawkInstalled(sharedDir)) {
-        rmSync(staged, { recursive: true, force: true });
-        cachedSquawkDir = sharedDir;
-        return sharedDir;
-      }
-    }
   }
   process.once('exit', () => rmSync(staged, { recursive: true, force: true }));
   cachedSquawkDir = staged;
@@ -563,3 +545,221 @@ test('skips ClickHouse-only PRs, honors -- squawk-ignore and allow-unsafe-migrat
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+test('auto-detects non-transactional filename and leading header markers unless .squawk.toml sets assume_in_transaction', () => {
+  const squawkDir = ensureSquawkInstall();
+  assert.equal(isNonTransactionalMigrationFile('migrations/0001.nontransactional.sql', ''), true);
+  assert.equal(isNonTransactionalMigrationFile('migrations/0001.no-transaction.sql', ''), true);
+  assert.equal(
+    isNonTransactionalMigrationFile(
+      'migrations/0001.sql',
+      '/* header */\n-- migrate:no-transaction\nCREATE INDEX CONCURRENTLY idx ON t (c);',
+    ),
+    true,
+  );
+  assert.equal(
+    isNonTransactionalMigrationFile(
+      'migrations/0001.sql',
+      '-- scope:no-transaction\nDROP INDEX CONCURRENTLY idx;',
+    ),
+    true,
+  );
+  assert.equal(
+    isNonTransactionalMigrationFile(
+      'migrations/0001.sql',
+      '-- nontransactional\nCREATE INDEX CONCURRENTLY idx ON t (c);',
+    ),
+    true,
+  );
+  assert.equal(
+    isNonTransactionalMigrationFile(
+      'migrations/0001.sql',
+      'CREATE TABLE t (id int);\n-- migrate:no-transaction after first statement',
+    ),
+    false,
+  );
+
+  const { dir, baseSha } = createRepoWithCommit({
+    'package.json': JSON.stringify({ name: 'svc', dependencies: { pg: '^8.12.0' } }),
+    'billing-migrations/0000_init.sql': 'CREATE TABLE "invoices" ("id" bigint PRIMARY KEY);',
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-nontx-'));
+
+  try {
+    // 1. Concurrent indexes in `*.nontransactional.sql`, `*.no-transaction.sql`, and `-- migrate:no-transaction` pass cleanly.
+    populateFiles(dir, {
+      'billing-migrations/0001_idx.nontransactional.sql':
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS "invoices_a_idx" ON "invoices" ("id");',
+      'billing-migrations/0002_idx.no-transaction.sql':
+        'DROP INDEX CONCURRENTLY IF EXISTS "invoices_a_idx";',
+      'billing-migrations/0003_hdr.sql': [
+        '-- migrate:no-transaction',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS "invoices_b_idx" ON "invoices" ("id");',
+      ].join('\n'),
+    });
+    commitAll(dir, 'add valid concurrent index migrations');
+
+    const cleanRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(cleanRes.exitCode, 0);
+    assert.equal(cleanRes.state, 'clean');
+    assert.equal(cleanRes.report.checkedFiles, 3);
+    assert.equal(cleanRes.report.addedCount, 0);
+
+    // 2. Non-concurrent `CREATE INDEX` in explicitly non-transactional files triggers `require-concurrent-index-creation`.
+    populateFiles(dir, {
+      'billing-migrations/0004_blocking.no-transaction.sql':
+        'CREATE INDEX IF NOT EXISTS "invoices_blocking_idx" ON "invoices" ("id");',
+      'billing-migrations/0005_blocking_hdr.sql': [
+        '-- scope:no-transaction',
+        'CREATE INDEX IF NOT EXISTS "invoices_blocking_hdr_idx" ON "invoices" ("id");',
+      ].join('\n'),
+    });
+    commitAll(dir, 'add blocking indexes in non-transactional files');
+
+    const failRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: baseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(failRes.exitCode, 1);
+    assert.equal(failRes.report.addedCount, 2);
+    assert.deepEqual(
+      failRes.report.added.map((r) => [r.file, r.rule]),
+      [
+        ['billing-migrations/0004_blocking.no-transaction.sql', 'require-concurrent-index-creation'],
+        ['billing-migrations/0005_blocking_hdr.sql', 'require-concurrent-index-creation'],
+      ],
+    );
+
+    // 3. Explicit `assume_in_transaction = true` in `.squawk.toml` overrides automatic file markers.
+    populateFiles(dir, {
+      '.squawk.toml': 'assume_in_transaction = true',
+    });
+    const explicitProfile = resolveSquawkProfile(
+      dir,
+      'billing-migrations/0001_idx.nontransactional.sql',
+    );
+    assert.equal(explicitProfile.assumeInTransaction, true);
+    assert.equal(
+      CONCURRENT_INDEX_RULES.every((r) => explicitProfile.excludedRules.includes(r)),
+      true,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('handles TOML whitespace/continuations, quoted SQL identifiers, comment semicolons, typechange, and metadata-added renames', () => {
+  const squawkDir = ensureSquawkInstall();
+
+  // TOML U+00A0 non-breaking space does not hang and returns empty fallback profile.
+  assert.deepEqual(parseSquawkToml('pg_version =\u00a0"16.0"'), {});
+
+  // Multiline basic string continuation with trailing spaces before newline.
+  assert.deepEqual(parseSquawkToml('pg_version = """16.\\   \n  4"""'), { pg_version: '16.4' });
+
+  // Whitespace inside quoted identifiers/literals stays intact while outer whitespace collapses.
+  const normSingleSpace = stripSqlCommentsAndCollapseWhitespace(
+    'ALTER   TABLE  "accounts"   DROP COLUMN "old flag"',
+  );
+  const normDoubleSpace = stripSqlCommentsAndCollapseWhitespace(
+    'ALTER TABLE "accounts" DROP COLUMN "old  flag"',
+  );
+  assert.notEqual(normSingleSpace, normDoubleSpace);
+  assert.equal(normDoubleSpace, 'ALTER TABLE "accounts" DROP COLUMN "old  flag"');
+
+  // Semicolons inside `--` and `/* */` comments do not split statement prefix signatures.
+  const baseLines = [
+    'CREATE TABLE "accounts" ("id" bigint);',
+    'ALTER TABLE "accounts" DROP COLUMN "legacy";',
+  ];
+  const commentedLines = [
+    'CREATE TABLE "accounts" ("id" bigint);',
+    '-- historical note; keep context',
+    '/* block comment; another semi */',
+    'ALTER TABLE "accounts" DROP COLUMN "legacy";',
+  ];
+  const baseSig = extractStatementSignature(baseLines, {
+    line: 1,
+    line_end: 1,
+    column: 23,
+    column_end: 43,
+  });
+  const commentedSig = extractStatementSignature(commentedLines, {
+    line: 3,
+    line_end: 3,
+    column: 23,
+    column_end: 43,
+  });
+  assert.equal(commentedSig, baseSig);
+
+  // Repo where base has SQL without `pg` yet, plus a symlinked SQL file.
+  const { dir, baseSha } = createRepoWithCommit({
+    'package.json': JSON.stringify({ name: 'app', dependencies: {} }),
+    'migrations/0001_old.sql': 'ALTER TABLE "accounts" DROP COLUMN "legacy";',
+    'notes/target.txt': 'placeholder',
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'pg-mig-edge-'));
+
+  try {
+    // Commit base symlink for typechange test.
+    symlinkSync('../notes/target.txt', path.join(dir, 'migrations/0002_replaced.sql'));
+    const symlinkBaseSha = commitAll(dir, 'add symlinked sql');
+
+    // Now add `pg` to package.json, rename `0001_old.sql` -> `0001_renamed.sql` with a semicolon comment,
+    // replace symlink `0002_replaced.sql` with a regular SQL file dropping quoted `"UInt64"` column!
+    rmSync(path.join(dir, 'migrations/0001_old.sql'));
+    rmSync(path.join(dir, 'migrations/0002_replaced.sql'));
+    populateFiles(dir, {
+      'package.json': JSON.stringify({ name: 'app', dependencies: { pg: '^8.12.0' } }),
+      'migrations/0001_renamed.sql': [
+        '-- renamed migration; SQL unchanged',
+        'ALTER TABLE "accounts" DROP COLUMN "legacy";',
+      ].join('\n'),
+      'migrations/0002_replaced.sql': 'ALTER TABLE "accounts" DROP COLUMN "UInt64";',
+    });
+    const headSha = commitAll(dir, 'enable pg, rename old sql, replace symlink with UInt64 drop');
+
+    // Quoted `"UInt64"` Postgres identifier must NOT be skipped as ClickHouse!
+    const uintDecision = classifySqlFile(
+      dir,
+      'migrations/0002_replaced.sql',
+      createClassifierCache(dir),
+    );
+    assert.equal(uintDecision.include, true);
+
+    const changed = collectChangedSqlEntries(dir, symlinkBaseSha, headSha);
+    assert.deepEqual(
+      changed.map((c) => [c.kind, c.headFile]),
+      [
+        ['renamed', 'migrations/0001_renamed.sql'],
+        ['added', 'migrations/0002_replaced.sql'],
+      ],
+    );
+
+    const checkRes = executePrCheck({
+      sourceDir: dir,
+      baseRef: symlinkBaseSha,
+      squawkInstallDir: squawkDir,
+      runnerTemp: scratch,
+    });
+    assert.equal(checkRes.exitCode, 1);
+    // `0001_renamed.sql` had pre-existing DROP COLUMN in base -> 0 new findings;
+    // `0002_replaced.sql` replaced symlink and drops `"UInt64"` -> 1 new finding!
+    assert.equal(checkRes.report.checkedFiles, 2);
+    assert.equal(checkRes.report.addedCount, 1);
+    assert.equal(checkRes.report.added[0].file, 'migrations/0002_replaced.sql');
+    assert.equal(checkRes.report.added[0].rule, 'ban-drop-column');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+

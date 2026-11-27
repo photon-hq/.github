@@ -12,9 +12,13 @@ import {
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  canCompareAsBaseMigrationSql,
   classifySqlFile,
   createClassifierCache,
   isRealPathInsideRepo,
+  normalizeGitRelPath,
+  resolveBaseFileProfile,
+  scanSqlTokens,
   serializeSquawkToml,
 } from './config.mjs';
 
@@ -32,7 +36,18 @@ function escapeSquawkGlobPath(relPath) {
 
 export function collectChangedSqlEntries(repoDir, baseSha, headSha) {
   const out = gitBuffer(
-    ['diff', '--find-renames', '--name-status', '-z', '--diff-filter=ACMR', baseSha, headSha, '--', '*.sql', '*.SQL'],
+    [
+      'diff',
+      '--find-renames',
+      '--name-status',
+      '-z',
+      '--diff-filter=ACMRT',
+      baseSha,
+      headSha,
+      '--',
+      '*.sql',
+      '*.SQL',
+    ],
     repoDir,
   ).toString('utf8');
 
@@ -44,8 +59,8 @@ export function collectChangedSqlEntries(repoDir, baseSha, headSha) {
     if (!status) continue;
     const code = status[0];
     if (code === 'R' || code === 'C') {
-      const oldPath = (fields[i++] ?? '').replace(/\\/g, '/');
-      const newPath = (fields[i++] ?? '').replace(/\\/g, '/');
+      const oldPath = normalizeGitRelPath(fields[i++] ?? '');
+      const newPath = normalizeGitRelPath(fields[i++] ?? '');
       if (!newPath) continue;
       if (code === 'R') {
         entries.push({ kind: 'renamed', baseFile: oldPath, headFile: newPath });
@@ -53,9 +68,9 @@ export function collectChangedSqlEntries(repoDir, baseSha, headSha) {
         entries.push({ kind: 'added', baseFile: null, headFile: newPath });
       }
     } else {
-      const filePath = (fields[i++] ?? '').replace(/\\/g, '/');
+      const filePath = normalizeGitRelPath(fields[i++] ?? '');
       if (!filePath) continue;
-      if (code === 'A') {
+      if (code === 'A' || code === 'T') {
         entries.push({ kind: 'added', baseFile: null, headFile: filePath });
       } else if (code === 'M') {
         entries.push({ kind: 'modified', baseFile: filePath, headFile: filePath });
@@ -66,54 +81,7 @@ export function collectChangedSqlEntries(repoDir, baseSha, headSha) {
 }
 
 export function stripSqlCommentsAndCollapseWhitespace(sqlFragment) {
-  let out = '';
-  let i = 0;
-  while (i < sqlFragment.length) {
-    const ch = sqlFragment[i];
-    if (ch === '-' && sqlFragment[i + 1] === '-') {
-      i += 2;
-      while (i < sqlFragment.length && sqlFragment[i] !== '\n' && sqlFragment[i] !== '\r') i++;
-      out += ' ';
-      continue;
-    }
-    if (ch === '/' && sqlFragment[i + 1] === '*') {
-      i += 2;
-      let depth = 1;
-      while (i < sqlFragment.length && depth > 0) {
-        if (sqlFragment[i] === '/' && sqlFragment[i + 1] === '*') {
-          depth++;
-          i += 2;
-        } else if (sqlFragment[i] === '*' && sqlFragment[i + 1] === '/') {
-          depth--;
-          i += 2;
-        } else {
-          i++;
-        }
-      }
-      out += ' ';
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      out += ch;
-      i++;
-      while (i < sqlFragment.length) {
-        const c = sqlFragment[i++];
-        out += c;
-        if (c === quote) {
-          if (sqlFragment[i] === quote) {
-            out += sqlFragment[i++];
-            continue;
-          }
-          break;
-        }
-      }
-      continue;
-    }
-    out += ch;
-    i++;
-  }
-  return out.replace(/\s+/g, ' ').trim();
+  return scanSqlTokens(sqlFragment, { keepQuotes: true });
 }
 
 function sliceLineUtf8Bytes(lineText, startByte, endByte = null) {
@@ -148,38 +116,45 @@ export function extractStatementSignature(fileLines, row) {
   }
   const normalizedSpan = stripSqlCommentsAndCollapseWhitespace(spanParts.join('\n'));
 
-  // Also capture statement head preceding the span (back to previous `;` or `--> statement-breakpoint`)
-  // so `DROP COLUMN "x"` on two different tables in the same migration file stay distinct.
-  const prefixLines = [];
-  const lookbackMin = Math.max(0, startLine - 50);
-  for (let ln = startLine; ln >= lookbackMin; ln--) {
-    const rawLine = ln === startLine ? sliceLineUtf8Bytes(fileLines[ln], 0, startCol) : fileLines[ln];
-    if (ln < startLine && /-->\s*statement-breakpoint/i.test(rawLine)) {
-      const afterBp = rawLine.split(/-->\s*statement-breakpoint/i).pop() ?? '';
-      if (afterBp.trim()) prefixLines.unshift(afterBp);
-      break;
-    }
-    const semiIdx = rawLine.lastIndexOf(';');
-    if (semiIdx >= 0) {
-      prefixLines.unshift(rawLine.slice(semiIdx + 1));
-      break;
-    }
-    prefixLines.unshift(rawLine);
+  // Capture statement head preceding the span (after the last top-level `;` or `--> statement-breakpoint`),
+  // ignoring semicolons inside SQL comments or quoted strings/identifiers.
+  const lookbackMin = startLine > 5000 ? startLine - 5000 : 0;
+  const prefixParts = [];
+  for (let ln = lookbackMin; ln < startLine; ln++) {
+    prefixParts.push(fileLines[ln]);
   }
-  const normalizedPrefix = stripSqlCommentsAndCollapseWhitespace(prefixLines.join('\n'));
+  prefixParts.push(sliceLineUtf8Bytes(fileLines[startLine], 0, startCol));
+  const prefixText = prefixParts.join('\n');
+
+  let stmtStart = 0;
+  scanSqlTokens(prefixText, {
+    keepQuotes: true,
+    onStatementBreak: (nextIdx) => {
+      stmtStart = nextIdx;
+    },
+  });
+  const normalizedPrefix = stripSqlCommentsAndCollapseWhitespace(prefixText.slice(stmtStart));
   return normalizedPrefix ? `${normalizedPrefix} :: ${normalizedSpan}` : normalizedSpan;
 }
 
 function normalizeReportedPath(rawFile, targetDir) {
   if (typeof rawFile !== 'string' || !rawFile) return '';
-  const asPosix = rawFile.replace(/\\/g, '/');
   if (path.isAbsolute(rawFile)) {
-    return path.relative(targetDir, rawFile).replace(/\\/g, '/');
+    const rel = path.relative(targetDir, rawFile);
+    return process.platform === 'win32' ? rel.replace(/\\/g, '/') : rel;
   }
-  return asPosix.replace(/^(?:\.\/)+/, '');
+  return normalizeGitRelPath(rawFile);
 }
 
-export function runSquawkScan({ targetDir, squawkInstallDir, tempDir, side, files, profile }) {
+export function runSquawkScan({
+  targetDir,
+  squawkInstallDir,
+  tempDir,
+  side,
+  files,
+  profile,
+  timeoutMs = 60_000,
+}) {
   if (!Array.isArray(files) || files.length === 0) return [];
 
   const squawkBin = path.join(squawkInstallDir, 'node_modules/.bin/squawk');
@@ -207,25 +182,19 @@ export function runSquawkScan({ targetDir, squawkInstallDir, tempDir, side, file
     [['CI', 'true'], ...passthroughVars.filter((k) => process.env[k]).map((k) => [k, process.env[k]])],
   );
 
-  const proc = spawnSync(
-    squawkBin,
-    [
-      'check',
-      '--no-error-on-unmatched-pattern',
-      '--config',
-      configPath,
-      '--reporter',
-      'json',
-      '--',
-      ...verifiedFiles.map(escapeSquawkGlobPath),
-    ],
-    {
-      cwd: targetDir,
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-      env: squawkEnv,
-    },
-  );
+  const cliArgs = ['check', '--no-error-on-unmatched-pattern'];
+  if (!profile.assumeInTransaction) {
+    cliArgs.push('--no-assume-in-transaction');
+  }
+  cliArgs.push('--config', configPath, '--reporter', 'json', '--', ...verifiedFiles.map(escapeSquawkGlobPath));
+
+  const proc = spawnSync(squawkBin, cliArgs, {
+    cwd: targetDir,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: timeoutMs,
+    env: squawkEnv,
+  });
 
   const stdoutTrimmed = (proc.stdout ?? '').trim();
   if (
@@ -418,6 +387,7 @@ export function executePrCheck(options = {}) {
     runnerTemp = process.env.RUNNER_TEMP,
     githubOutput = process.env.GITHUB_OUTPUT,
     githubStepSummary = process.env.GITHUB_STEP_SUMMARY,
+    squawkTimeoutMs = 60_000,
   } = options;
   const squawkInstallDir =
     options.squawkInstallDir ?? (runnerTemp ? path.join(runnerTemp, 'squawk') : '');
@@ -486,6 +456,7 @@ export function executePrCheck(options = {}) {
         side: `head-${groupIdx}`,
         files: entries.map((e) => e.headFile),
         profile,
+        timeoutMs: squawkTimeoutMs,
       });
       headFindings.push(...found);
     }
@@ -503,13 +474,22 @@ export function executePrCheck(options = {}) {
 
       const baseGroups = new Map();
       for (const entry of existingEntries) {
-        if (entry.kind === 'renamed') {
-          const baseDecision = classifySqlFile(baseWorktree, entry.baseFile, baseCache);
-          if (!baseDecision.include) continue;
+        if (!canCompareAsBaseMigrationSql(baseWorktree, entry.baseFile, entry.profile, baseCache)) {
+          continue;
         }
         baseToHeadMap.set(entry.baseFile, entry.headFile);
-        const baseProfile = { ...entry.profile, excludedPaths: [] };
-        const key = JSON.stringify(baseProfile);
+        const baseProfile = resolveBaseFileProfile(
+          baseWorktree,
+          entry.baseFile,
+          entry.profile,
+          baseCache,
+        );
+        const key = JSON.stringify({
+          pgVersion: baseProfile.pgVersion,
+          assumeInTransaction: baseProfile.assumeInTransaction,
+          excludedRules: baseProfile.excludedRules,
+          includedRules: baseProfile.includedRules,
+        });
         let group = baseGroups.get(key);
         if (!group) {
           group = { profile: baseProfile, files: [] };
@@ -528,6 +508,7 @@ export function executePrCheck(options = {}) {
           side: `base-${baseIdx}`,
           files,
           profile,
+          timeoutMs: squawkTimeoutMs,
         });
         baseFindings.push(...found);
       }

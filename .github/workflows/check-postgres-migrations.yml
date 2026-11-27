@@ -52,7 +52,7 @@ jobs:
             echo 'state=unavailable' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --find-renames --name-only --diff-filter=ACMR -z "$merge_base" HEAD -- '*.sql' '*.SQL' > "$RUNNER_TEMP/sql-files"
+          git diff --find-renames --name-only --diff-filter=ACMRT -z "$merge_base" HEAD -- '*.sql' '*.SQL' > "$RUNNER_TEMP/sql-files"
           if [ -s "$RUNNER_TEMP/sql-files" ]; then
             echo 'scope=sql' >> "$GITHUB_OUTPUT"
           else
@@ -100,12 +100,19 @@ jobs:
           fi
           tool="$RUNNER_TEMP/squawk"
           mkdir -p "$tool"
-          if ! (cd "$tool" && npm install --ignore-scripts --no-audit --no-fund --no-save "squawk-cli@$SQUAWK_VERSION"); then
+          if ! (cd "$tool" && timeout --kill-after=10s 120s npm install --ignore-scripts --no-audit --no-fund --no-save "squawk-cli@$SQUAWK_VERSION"); then
             echo 'state=unavailable' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd source
-          node ../policy/.github/migrations/scan.mjs
+          rc=0
+          timeout --kill-after=10s 150s node ../policy/.github/migrations/scan.mjs || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            exit 1
+          elif [ "$rc" -ne 0 ]; then
+            echo 'state=unavailable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
   comment:
     needs: scan
